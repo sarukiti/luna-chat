@@ -1,7 +1,8 @@
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai/models";
 import { describe, expect, it } from "vitest";
 
-import { createAgentModels } from "./agent-runtime";
+import { DEFAULT_WORKSPACE_CONFIG } from "../modules/workspace/domain/workspace-config";
+import { activeModelSelectionsOf, createAgentModels, usesProvider } from "./agent-runtime";
 
 describe("createAgentModels", () => {
 	const models = createAgentModels("/nonexistent/luna-home");
@@ -46,5 +47,27 @@ describe("createAgentModels", () => {
 
 		expect(ids.filter((id) => id === "gpt-6.2-sol")).toHaveLength(1);
 		expect(ids.filter((id) => id === "gpt-6.2-astra")).toHaveLength(1);
+	});
+});
+
+describe("activeModelSelectionsOf", () => {
+	it("すべての実行モデルが antigravity のときは未使用の compaction と voice を含めない", () => {
+		const agy = { provider: "antigravity", model: "gemini-4-neon", thinking: "high" as const };
+		const selections = activeModelSelectionsOf({
+			models: {
+				...DEFAULT_WORKSPACE_CONFIG.models,
+				conversation: agy,
+				event: agy,
+				worker: {
+					default: "standard",
+					choices: { standard: { ...agy, description: "general" } },
+				},
+			},
+		});
+
+		expect(usesProvider(selections, "antigravity")).toBe(true);
+		expect(usesProvider(selections, "openai-codex")).toBe(false);
+		expect(selections).not.toHaveProperty("compaction");
+		expect(selections).not.toHaveProperty("voice");
 	});
 });

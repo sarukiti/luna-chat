@@ -4,6 +4,9 @@ import { resolve } from "node:path";
 import type { Models } from "@earendil-works/pi-ai";
 import type { Client } from "discord.js";
 
+import { ANTIGRAVITY_PROVIDER_ID } from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
+import { CompositeAgentRuntime } from "../modules/agent/adapters/outbound/antigravity/composite-agent-runtime";
+import { OPENAI_CODEX_PROVIDER_ID } from "../modules/agent/adapters/outbound/pi/chatgpt-backend";
 import { PiModelStreams } from "../modules/agent/adapters/outbound/pi/pi-model-stream";
 import { fetchUsage } from "../modules/agent/adapters/outbound/pi/usage";
 import { UsagePoller } from "../modules/agent/adapters/outbound/pi/usage-poller";
@@ -144,10 +147,13 @@ import type {
 	VoiceSetting,
 } from "../modules/workspace/domain/workspace-config";
 import {
+	activeModelSelectionsOf,
+	createAntigravityAcpRuntime,
 	createChatGptBackend,
 	createAgentModels,
 	modelSelectionsOf,
 	createPiAgentRuntime,
+	usesProvider,
 	validateModelSelections,
 	workerCatalogOf,
 } from "./agent-runtime";
@@ -310,7 +316,10 @@ export async function startLunaApplication(
 		]);
 	};
 	const backend = createChatGptBackend(models);
-	const agent = createPiAgentRuntime({
+	const skillUsage = new SkillUsageStore(
+		resolve(workspace.lunaHomeDir, "state", "skill-usage.json"),
+	);
+	const piAgent = createPiAgentRuntime({
 		backend,
 		compactionModel: workspace.config.models.compaction,
 		lunaHomeDir: workspace.lunaHomeDir,
@@ -318,18 +327,42 @@ export async function startLunaApplication(
 		models,
 		parentEnvironment: process.env,
 		requestTimeoutMs: workspace.config.agent.requestTimeoutMs,
-		skillUsage: new SkillUsageStore(resolve(workspace.lunaHomeDir, "state", "skill-usage.json")),
+		skillUsage,
 	});
-	validateModelSelections(agent, {
+	const configuredSelections = {
 		...modelSelectionsOf(workspace.config.models),
 		...(minecraftSetting === undefined ? {} : { minecraft: minecraftSetting.planner }),
+	};
+	const activeSelections = activeModelSelectionsOf(workspace.config);
+	if (
+		workspace.config.voice !== undefined &&
+		workspace.config.models.voice.provider === ANTIGRAVITY_PROVIDER_ID
+	) {
+		throw new Error("models.voice: antigravity provider is not supported for voice front model");
+	}
+	const usesAntigravity = usesProvider(configuredSelections, ANTIGRAVITY_PROVIDER_ID);
+	const usesOpenAiCodex = usesProvider(activeSelections, OPENAI_CODEX_PROVIDER_ID);
+	const antigravityAgent = usesAntigravity
+		? createAntigravityAcpRuntime({
+				lunaHomeDir: workspace.lunaHomeDir,
+				workspaceDir: workspace.workspaceDir,
+				logger,
+				parentEnvironment: process.env,
+				requestTimeoutMs: workspace.config.agent.requestTimeoutMs,
+				skillUsage,
+			})
+		: undefined;
+	const agent = new CompositeAgentRuntime({
+		pi: piAgent,
+		antigravity: antigravityAgent,
+		preferAntigravityAuth: !usesOpenAiCodex && antigravityAgent !== undefined,
 	});
 	const usage = new UsagePoller({
 		fetch: async (signal) => await fetchUsage(backend, signal),
 		filePath: resolve(workspace.lunaHomeDir, "state", "usage.json"),
 		intervalMs: USAGE_POLL_INTERVAL_MS,
 		logger,
-		onUsage: (snapshot) => agent.setUsage(snapshot),
+		onUsage: (snapshot) => piAgent.setUsage(snapshot),
 	});
 	const withHomeAssistant = (
 		instructions: readonly string[],
@@ -402,6 +435,7 @@ export async function startLunaApplication(
 		async () => await minecraft?.stop(),
 		async () => await client.destroy(),
 		async () => await usage.stop(),
+		async () => await antigravityAgent?.close(),
 	];
 	// abort時は待機中の起動処理を解くだけにする。ここで全て閉じるとabort後に生成されたリソースが漏れ、
 	// catchで再実行するとHTTPサーバーを二重closeするため、後始末はcatchで1回だけ行う。
@@ -413,7 +447,11 @@ export async function startLunaApplication(
 	options.startupSignal?.addEventListener("abort", abortStartup, { once: true });
 	try {
 		options.startupSignal?.throwIfAborted();
-		usage.start();
+		await antigravityAgent?.start(options.startupSignal);
+		validateModelSelections(agent, configuredSelections);
+		if (usesOpenAiCodex) {
+			usage.start();
+		}
 		await client.login(environment.discordBotToken);
 		options.startupSignal?.throwIfAborted();
 		const lunaUserId = discordIdSchema.parse(client.user?.id);
@@ -551,7 +589,7 @@ export async function startLunaApplication(
 								logger,
 								pruner: {
 									prune: async (now, retentionMs) => {
-										await agent.pruneTranscripts(now, retentionMs);
+										await piAgent.pruneTranscripts(now, retentionMs);
 									},
 								},
 								retentionMs: workspace.config.agent.transcriptRetentionMs,
@@ -689,6 +727,7 @@ export async function startLunaApplication(
 					tasks: taskService,
 					typingRelease: () => typing.releaseAll(),
 					usageStop: () => usage.stop(),
+					antigravityClose: async () => await antigravityAgent?.close(),
 					voiceStop: async () => await voice?.stop(),
 					minecraftStop: async () => await minecraft?.stop(),
 				});
@@ -721,6 +760,7 @@ export async function shutdownApplication(input: {
 	tasks: Pick<TaskService, "drain" | "stopIntake">;
 	typingRelease(): void;
 	usageStop(): Promise<void>;
+	antigravityClose?: () => Promise<void>;
 	voiceStop(): Promise<void>;
 }): Promise<void> {
 	input.logger.info("application.shutdown_started");
@@ -753,6 +793,7 @@ export async function shutdownApplication(input: {
 			input.minecraftStop(),
 			runCleanup(() => input.typingRelease()),
 			input.usageStop(),
+			...(input.antigravityClose === undefined ? [] : [input.antigravityClose()]),
 			input.clientDestroy(),
 		],
 		failures,

@@ -7,6 +7,8 @@ import type { Models, Provider } from "@earendil-works/pi-ai/models";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 
+import { ANTIGRAVITY_PROVIDER_ID } from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
+import { AntigravityAcpRuntime } from "../modules/agent/adapters/outbound/antigravity/antigravity-agent-runtime";
 import { ChatGptBackend } from "../modules/agent/adapters/outbound/pi/chatgpt-backend";
 import { claudeCodeProvider } from "../modules/agent/adapters/outbound/pi/claude-code/provider";
 import { FileCredentialStore } from "../modules/agent/adapters/outbound/pi/file-credential-store";
@@ -22,6 +24,7 @@ import { toPiAgentTool } from "../modules/agent/adapters/outbound/pi/pi-tool-ada
 import { createShellTools } from "../modules/agent/adapters/outbound/pi/shell-tools";
 import { createWebRunTool } from "../modules/agent/adapters/outbound/pi/web-run-tool";
 import type {
+	AgentRuntimePort,
 	AgentSessionSpec,
 	HarnessToolName,
 	ModelSelection,
@@ -44,6 +47,10 @@ export function credentialsPath(lunaHomeDir: string): string {
 
 function claudeCodeConfigDir(lunaHomeDir: string): string {
 	return resolve(lunaHomeDir, "claude-code");
+}
+
+function antigravityDir(lunaHomeDir: string): string {
+	return resolve(lunaHomeDir, "antigravity");
 }
 
 export function createAgentModels(lunaHomeDir: string): Models {
@@ -121,7 +128,7 @@ export function modelSelectionsOf(
 }
 
 export function validateModelSelections(
-	runtime: Pick<PiAgentRuntime, "listModels">,
+	runtime: Pick<AgentRuntimePort, "listModels">,
 	selections: Readonly<Record<string, ModelSelection>>,
 ): void {
 	const catalog = runtime.listModels();
@@ -139,6 +146,79 @@ export function validateModelSelections(
 			);
 		}
 	}
+}
+
+export function usesProvider(
+	selections: Readonly<Record<string, ModelSelection>>,
+	provider: string,
+): boolean {
+	return Object.values(selections).some((selection) => selection.provider === provider);
+}
+
+// 実際に実行時に使われるモデルの集合を返す。antigravity だけを使う場合、未使用の compaction/voice 既定値で
+// openai-codex 使用枠ポーリングが誤起動しないようにする。
+export function activeModelSelectionsOf(
+	config: Pick<WorkspaceConfig, "models" | "voice" | "minecraft">,
+): Readonly<Record<string, ModelSelection>> {
+	const workers = Object.fromEntries(
+		workerCatalogOf(config.models.worker).choices.map((choice) => [
+			`worker.choices.${choice.name}`,
+			choice.model,
+		]),
+	);
+	const sessionSelections: Record<string, ModelSelection> = {
+		conversation: config.models.conversation,
+		event: config.models.event,
+		...workers,
+		...(config.minecraft === undefined ? {} : { minecraft: config.minecraft.planner }),
+	};
+	const needsCompaction = Object.values(sessionSelections).some(
+		(selection) => selection.provider !== ANTIGRAVITY_PROVIDER_ID,
+	);
+	return {
+		...sessionSelections,
+		...(needsCompaction ? { compaction: config.models.compaction } : {}),
+		...(config.voice === undefined ? {} : { voice: config.models.voice }),
+	};
+}
+
+export function createAntigravityAcpRuntime(input: {
+	lunaHomeDir: string;
+	workspaceDir: string;
+	logger: LoggerPort;
+	parentEnvironment: NodeJS.ProcessEnv;
+	requestTimeoutMs: number;
+	skillUsage: SkillUsageStore;
+}): AntigravityAcpRuntime {
+	const recordSkillUse = (names: readonly string[]): void => {
+		if (names.length === 0) return;
+		input.skillUsage.record(names, new Date()).catch((error: unknown) => {
+			input.logger.error("workspace.skill_usage_write_failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	};
+	return new AntigravityAcpRuntime({
+		workspaceDir: input.workspaceDir,
+		geminiDir: antigravityDir(input.lunaHomeDir),
+		transcriptDir: resolve(input.lunaHomeDir, "sessions"),
+		scratchRoot: resolve(tmpdir(), "luna"),
+		childEnvironment: withoutSecrets(input.parentEnvironment),
+		retryDelaysMs: TURN_RETRY_DELAYS_MS,
+		requestTimeoutMs: input.requestTimeoutMs,
+		logger: input.logger,
+		now: () => new Date(),
+		onSkillToolCall: (name, args) => {
+			if (
+				name === "read_file" ||
+				name === "read" ||
+				name === "exec_command" ||
+				name === "run_command"
+			) {
+				recordSkillUse(findSkillNames(args));
+			}
+		},
+	});
 }
 
 export function createPiAgentRuntime(input: {
