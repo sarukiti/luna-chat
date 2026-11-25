@@ -10,6 +10,7 @@ import type {
 	AgentSessionPhase,
 	AgentSessionSpec,
 	AgentSessionStatus,
+	AgentToolResult,
 	ModelSelection,
 } from "../../../ports/outbound/agent-session-port";
 import { formatLunaInput } from "../pi/luna-input-message";
@@ -18,8 +19,23 @@ import type { HarnessBackground } from "../pi/pi-agent-session";
 import type { TranscriptWriter } from "../pi/pi-transcript";
 import { AcpProcessError, AcpTimeoutError, classifyAcpError, isClientAlive } from "./acp-client";
 import type { AcpClientPort } from "./acp-client";
-import { ANTIGRAVITY_PROVIDER_ID } from "./acp-protocol";
+import {
+	ANTIGRAVITY_PROVIDER_ID,
+	extractAcpToolArgs,
+	extractAcpToolName,
+	resolveMcpToolName,
+} from "./acp-protocol";
 import type { AcpMcpServerConfig, AcpSessionUpdate } from "./acp-protocol";
+import type { McpToolExecutionRecord } from "./mcp-bridge";
+
+type PendingBuiltinToolCall = {
+	id: string;
+	name: string | undefined;
+	args: unknown;
+	rawOutput: unknown;
+	status: string | undefined;
+	notified: boolean;
+};
 
 export type AntigravityAgentSessionInput = Readonly<{
 	id: string;
@@ -27,6 +43,7 @@ export type AntigravityAgentSessionInput = Readonly<{
 	scratchDir: string;
 	systemPromptAppend: string;
 	mcpServer: AcpMcpServerConfig;
+	mcpToolNames?: ReadonlySet<string>;
 	unregisterMcp(): void;
 	bindRunSignal(getter: () => AbortSignal | undefined): void;
 	getClient(): Promise<AcpClientPort>;
@@ -48,6 +65,7 @@ export class AntigravityAgentSession implements AgentSession {
 	readonly id: string;
 	readonly #input: AntigravityAgentSessionInput;
 	readonly #logger: LoggerPort;
+	readonly #mcpToolNames: ReadonlySet<string>;
 	readonly #spec: AgentSessionSpec;
 	readonly #transcript: TranscriptWriter;
 
@@ -58,6 +76,8 @@ export class AntigravityAgentSession implements AgentSession {
 		resolve: (wakeup: ActivityWakeup) => void;
 	}> = [];
 	#activeClient: AcpClientPort | undefined;
+	#builtinToolCounter = 0;
+	#builtinTools = new Map<string, PendingBuiltinToolCall>();
 	#closed = false;
 	#inFlightSteers: Promise<unknown>[] = [];
 	#modelDirty = false;
@@ -78,6 +98,7 @@ export class AntigravityAgentSession implements AgentSession {
 		this.id = input.id;
 		this.#input = input;
 		this.#logger = input.logger;
+		this.#mcpToolNames = input.mcpToolNames ?? new Set<string>();
 		this.#spec = input.spec;
 		this.#transcript = input.transcript;
 		this.#modelSelection = input.spec.model;
@@ -215,6 +236,18 @@ export class AntigravityAgentSession implements AgentSession {
 		}
 	}
 
+	onMcpToolExecuted(record: McpToolExecutionRecord): void {
+		if (this.#closed) {
+			return;
+		}
+		this.#appendToolInteraction({
+			toolCallId: record.toolCallId,
+			name: record.name,
+			arguments: record.arguments,
+			result: record.result,
+		});
+	}
+
 	async abort(): Promise<void> {
 		if (!this.#running) {
 			return;
@@ -303,6 +336,7 @@ export class AntigravityAgentSession implements AgentSession {
 
 		while (true) {
 			this.#turnText = "";
+			this.#builtinTools.clear();
 			this.#inFlightSteers = [];
 			this.#abortController = new AbortController();
 			const signal = this.#abortController.signal;
@@ -335,6 +369,8 @@ export class AntigravityAgentSession implements AgentSession {
 					}
 				}
 
+				this.#flushPendingBuiltinTools();
+
 				if (this.#isAbortRequested() || cancelled) {
 					return { status: "aborted" };
 				}
@@ -348,14 +384,16 @@ export class AntigravityAgentSession implements AgentSession {
 				}
 
 				const finalText = this.#turnText.trim() === "" ? null : this.#turnText;
+				const now = this.#input.now();
 				this.#transcript.append({
 					type: "message",
-					at: this.#input.now().toISOString(),
+					at: now.toISOString(),
 					message: {
 						role: "assistant",
 						content: finalText == null ? [] : [{ type: "text", text: finalText }],
 						stopReason: result.stopReason,
 						usage: result.usage,
+						timestamp: now.getTime(),
 					},
 				});
 				this.#input.onRunCompleted();
@@ -460,15 +498,123 @@ export class AntigravityAgentSession implements AgentSession {
 			this.#turnText += update.content.text;
 			return;
 		}
-		if (update.sessionUpdate === "tool_call" && update.name !== undefined) {
-			this.#input.onToolCall?.(update.name, update.args);
+		if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+			return;
+		}
+		const existing =
+			update.toolCallId !== undefined ? this.#builtinTools.get(update.toolCallId) : undefined;
+		const name = extractAcpToolName(update) ?? existing?.name;
+		if (resolveMcpToolName(name, this.#mcpToolNames) !== undefined) {
+			// MCP ツールは LocalMcpBridge 側の実行結果フックで正確な引数・結果を記録する。
+			if (update.toolCallId !== undefined) {
+				this.#builtinTools.delete(update.toolCallId);
+			}
+			return;
+		}
+		const id = update.toolCallId ?? `acp-tool-${String(++this.#builtinToolCounter)}`;
+		const args = extractAcpToolArgs(update);
+		const entry: PendingBuiltinToolCall = existing ?? {
+			id,
+			name: undefined,
+			args: undefined,
+			rawOutput: undefined,
+			status: undefined,
+			notified: false,
+		};
+		if (name !== undefined) {
+			entry.name = name;
+		}
+		if (args !== undefined) {
+			entry.args = args;
+		}
+		if (update.rawOutput !== undefined) {
+			entry.rawOutput = update.rawOutput;
+		}
+		if (update.status !== undefined) {
+			entry.status = update.status;
+		}
+		if (!entry.notified && entry.name !== undefined && entry.args !== undefined) {
+			entry.notified = true;
+			this.#input.onToolCall?.(entry.name, entry.args);
+		}
+		this.#builtinTools.set(id, entry);
+		if (entry.status === "completed" || entry.status === "failed") {
+			this.#builtinTools.delete(id);
+			this.#finalizeBuiltinTool(entry);
+		}
+	}
+
+	#flushPendingBuiltinTools(): void {
+		for (const entry of this.#builtinTools.values()) {
+			this.#finalizeBuiltinTool(entry);
+		}
+		this.#builtinTools.clear();
+	}
+
+	#finalizeBuiltinTool(entry: PendingBuiltinToolCall): void {
+		if (entry.name === undefined) {
+			return;
+		}
+		const normalizedArgs = normalizeToolArguments(entry.args);
+		if (!entry.notified) {
+			entry.notified = true;
+			this.#input.onToolCall?.(entry.name, normalizedArgs);
+		}
+		const resultText = formatRawOutput(entry.rawOutput);
+		const isError = entry.status === "failed";
+		this.#appendToolInteraction({
+			toolCallId: entry.id,
+			name: entry.name,
+			arguments: normalizedArgs,
+			result:
+				resultText === undefined && !isError
+					? undefined
+					: { text: resultText ?? "", images: [], isError },
+		});
+	}
+
+	#appendToolInteraction(input: {
+		toolCallId: string;
+		name: string;
+		arguments: unknown;
+		result: AgentToolResult | undefined;
+	}): void {
+		const now = this.#input.now();
+		const at = now.toISOString();
+		const timestamp = now.getTime();
+		const content: Array<Record<string, unknown>> = [];
+		if (this.#turnText.trim() !== "") {
+			content.push({ type: "text", text: this.#turnText });
+		}
+		this.#turnText = "";
+		content.push({
+			type: "toolCall",
+			id: input.toolCallId,
+			name: input.name,
+			arguments: normalizeToolArguments(input.arguments),
+		});
+		this.#transcript.append({
+			type: "message",
+			at,
+			message: {
+				role: "assistant",
+				content,
+				stopReason: "toolUse",
+				timestamp,
+			},
+		});
+		if (input.result !== undefined) {
 			this.#transcript.append({
-				type: "tool_call",
-				at: this.#input.now().toISOString(),
-				toolCallId: update.toolCallId,
-				name: update.name,
-				args: update.args,
-				status: update.status,
+				type: "message",
+				at,
+				message: {
+					role: "toolResult",
+					toolCallId: input.toolCallId,
+					toolName: input.name,
+					content: toToolResultContent(input.result),
+					isError: input.result.isError,
+					timestamp,
+				},
 			});
 		}
 	}
@@ -551,6 +697,31 @@ function isCancelledResult(value: unknown): boolean {
 		"stopReason" in value &&
 		value.stopReason === "cancelled"
 	);
+}
+
+function normalizeToolArguments(value: unknown): unknown {
+	return value === undefined ? {} : value;
+}
+
+function formatRawOutput(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string") return value;
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function toToolResultContent(result: AgentToolResult): Array<Record<string, unknown>> {
+	const content: Array<Record<string, unknown>> = [];
+	if (result.text !== "") {
+		content.push({ type: "text", text: result.text });
+	}
+	for (const image of result.images) {
+		content.push({ type: "image", data: image.data, mimeType: image.mimeType });
+	}
+	return content;
 }
 
 function wakeupFor(notices: readonly ActivityNotice[], filter: ActivityWaitFilter): ActivityWakeup {

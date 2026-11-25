@@ -18,12 +18,16 @@ import type { HarnessBackground, HarnessBackgroundListener } from "../pi/pi-agen
 import { pruneTranscripts, TranscriptWriter, transcriptFilePath } from "../pi/pi-transcript";
 import { createShellTools } from "../pi/shell-tools";
 import { classifyAcpError, isClientAlive, StdioAcpClient } from "./acp-client";
-import type { AcpClientPort } from "./acp-client";
+import type { AcpClientPort, AcpPermissionOutcome } from "./acp-client";
 import { ANTIGRAVITY_PROVIDER_ID, extractAntigravityModels } from "./acp-protocol";
+import type { AcpRequestPermissionParams } from "./acp-protocol";
 import { AntigravityAgentSession } from "./antigravity-agent-session";
 import { LocalMcpBridge } from "./mcp-bridge";
 
 const NO_BACKGROUND: HarnessBackground = { count: () => 0, stopAll: async () => {} };
+
+const DEFAULT_ROUTING_INSTRUCTIONS =
+	"For shell commands (especially run_in_background, which reports background_exit back to this session), use the MCP tools exec_command, write_stdin, and stop_background. For reading, editing, or writing workspace files, viewing images, web search, and image generation, use the built-in tools. For Discord, task management, HTTP responses, Home Assistant, and wait, always use the corresponding MCP tools.";
 
 type AntigravityShellToolsFactory = (input: {
 	cwd: string;
@@ -33,6 +37,10 @@ type AntigravityShellToolsFactory = (input: {
 	tools: readonly AgentTool[];
 	background: HarnessBackground;
 	dispose(): Promise<void>;
+}>;
+
+type AntigravityPermissionContext = Readonly<{
+	mcpToolNames: ReadonlySet<string>;
 }>;
 
 export type AntigravityAcpRuntimeOptions = Readonly<{
@@ -45,7 +53,14 @@ export type AntigravityAcpRuntimeOptions = Readonly<{
 	requestTimeoutMs: number;
 	logger: LoggerPort;
 	now(): Date;
+	dangerouslySkipPermissions?: boolean;
+	onPermissionRequest?: (
+		params: AcpRequestPermissionParams,
+		context: AntigravityPermissionContext,
+	) => AcpPermissionOutcome;
+	routingInstructions?: string;
 	onSkillToolCall?: (name: string, args: unknown) => void;
+	onBuiltinToolCall?: (name: string, args: unknown) => void;
 	createClient?: (input: { cwd: string; geminiDir: string }) => AcpClientPort;
 	createShellTools?: AntigravityShellToolsFactory;
 }>;
@@ -54,6 +69,7 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 	readonly #options: AntigravityAcpRuntimeOptions;
 	readonly #mcpBridge: LocalMcpBridge;
 	readonly #sessions = new Map<string, AntigravityAgentSession>();
+	readonly #sessionMcpTools = new Map<string, ReadonlySet<string>>();
 
 	#authFailed = false;
 	#client: AcpClientPort | undefined;
@@ -106,11 +122,14 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 		mkdirSync(scratchDir, { recursive: true, mode: 0o700 });
 
 		const wanted = new Set<HarnessToolName>(spec.harnessTools);
-		const wantsShell =
-			wanted.has("exec_command") || wanted.has("write_stdin") || wanted.has("stop_background");
+		const wantsHarness =
+			this.#options.createShellTools !== undefined ||
+			wanted.has("exec_command") ||
+			wanted.has("write_stdin") ||
+			wanted.has("stop_background");
 
 		let opened: AntigravityAgentSession | undefined;
-		const shell = wantsShell
+		const shell = wantsHarness
 			? this.#createShellTools({
 					cwd: spec.cwd,
 					scratchDir,
@@ -123,11 +142,12 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 			: undefined;
 
 		const shellTools = (shell?.tools ?? [])
-			.filter((tool) => isShellHarnessToolName(tool.name) && wanted.has(tool.name))
+			.filter((tool) => isHarnessToolName(tool.name) && wanted.has(tool.name))
 			.map((tool) =>
 				tool.name === "exec_command" ? observeToolCall(tool, this.#options.onSkillToolCall) : tool,
 			);
 		const allMcpTools = [...spec.tools, ...shellTools];
+		const mcpToolNames = new Set(allMcpTools.map((tool) => tool.name));
 
 		let getRunSignal: () => AbortSignal | undefined = () => undefined;
 		let registration: ReturnType<LocalMcpBridge["registerSession"]>;
@@ -135,6 +155,9 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 			registration = this.#mcpBridge.registerSession({
 				tools: allMcpTools,
 				getRunSignal: () => getRunSignal(),
+				onToolExecuted: (record) => {
+					opened?.onMcpToolExecuted(record);
+				},
 			});
 		} catch (error: unknown) {
 			void shell?.dispose().catch((disposeError: unknown) => {
@@ -145,13 +168,18 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 			throw error;
 		}
 
-		const systemPromptAppend = buildAntigravitySystemPrompt(spec.systemPrompt, scratchDir);
+		const systemPromptAppend = buildAntigravitySystemPrompt(
+			spec.systemPrompt,
+			scratchDir,
+			this.#options.routingInstructions ?? DEFAULT_ROUTING_INSTRUCTIONS,
+		);
 		const session = new AntigravityAgentSession({
 			id,
 			spec,
 			scratchDir,
 			systemPromptAppend,
 			mcpServer: registration.serverConfig,
+			mcpToolNames,
 			unregisterMcp: registration.unregister,
 			bindRunSignal: (getter) => {
 				getRunSignal = getter;
@@ -173,7 +201,10 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 			}),
 			logger: this.#options.logger,
 			now: this.#options.now,
-			onToolCall: this.#options.onSkillToolCall,
+			onToolCall: (name, args) => {
+				this.#options.onSkillToolCall?.(name, args);
+				this.#options.onBuiltinToolCall?.(name, args);
+			},
 			onRunCompleted: () => {
 				this.#authFailed = false;
 			},
@@ -182,10 +213,12 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 			},
 			onClosed: (sessionId) => {
 				this.#sessions.delete(sessionId);
+				this.#sessionMcpTools.delete(sessionId);
 			},
 		});
 		opened = session;
 		this.#sessions.set(id, session);
+		this.#sessionMcpTools.set(id, mcpToolNames);
 		return session;
 	}
 
@@ -238,6 +271,14 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 					cwd: this.#options.workspaceDir,
 					geminiDir: this.#options.geminiDir,
 					env: this.#options.childEnvironment,
+					dangerouslySkipPermissions: this.#options.dangerouslySkipPermissions,
+					onPermissionRequest:
+						this.#options.onPermissionRequest === undefined
+							? undefined
+							: (params) =>
+									this.#options.onPermissionRequest!(params, {
+										mcpToolNames: this.#allMcpToolNames(),
+									}),
 					logger: this.#options.logger,
 				});
 			try {
@@ -290,6 +331,16 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 		}
 	}
 
+	#allMcpToolNames(): ReadonlySet<string> {
+		const names = new Set<string>();
+		for (const set of this.#sessionMcpTools.values()) {
+			for (const name of set) {
+				names.add(name);
+			}
+		}
+		return names;
+	}
+
 	#recordFailure(reason: AgentRunFailureReason, message: string): void {
 		this.#lastFailure = { at: this.#options.now().toISOString(), message };
 		if (reason === "auth_required") {
@@ -298,18 +349,30 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 	}
 }
 
-function buildAntigravitySystemPrompt(systemPrompt: string, scratchDir: string): string {
+function buildAntigravitySystemPrompt(
+	systemPrompt: string,
+	scratchDir: string,
+	routingInstructions: string,
+): string {
 	return [
 		systemPrompt,
 		`# Scratch directory\n\nThis session's scratch directory is ${scratchDir}. exec_command sets it as TMPDIR.`,
-		`# Antigravity tool routing\n\nFor shell commands (especially run_in_background, which reports background_exit back to this session), use the MCP tools exec_command, write_stdin, and stop_background. For reading, editing, or writing workspace files, viewing images, web search, and image generation, use the built-in tools. For Discord, task management, HTTP responses, Home Assistant, and wait, always use the corresponding MCP tools.`,
+		`# Antigravity tool routing\n\n${routingInstructions}`,
 	].join("\n\n");
 }
 
-function isShellHarnessToolName(
-	name: string,
-): name is "exec_command" | "write_stdin" | "stop_background" {
-	return name === "exec_command" || name === "write_stdin" || name === "stop_background";
+function isHarnessToolName(name: string): name is HarnessToolName {
+	return (
+		name === "exec_command" ||
+		name === "write_stdin" ||
+		name === "stop_background" ||
+		name === "read" ||
+		name === "edit" ||
+		name === "write" ||
+		name === "view_image" ||
+		name === "web_run" ||
+		name === "image_gen"
+	);
 }
 
 function observeToolCall(

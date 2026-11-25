@@ -4,6 +4,7 @@ import { z } from "zod";
 import { createRecordingLogger } from "../../../../observability/testing/recording-logger";
 import type { AgentTool } from "../../../ports/outbound/agent-session-port";
 import { LocalMcpBridge } from "./mcp-bridge";
+import type { McpToolExecutionRecord } from "./mcp-bridge";
 
 const bridges: LocalMcpBridge[] = [];
 
@@ -254,5 +255,53 @@ describe("LocalMcpBridge", () => {
 		expect(() =>
 			bridge.registerSession({ tools: [tool, tool], getRunSignal: () => undefined }),
 		).toThrow("Duplicated agent tool name: dup");
+	});
+
+	it("tools/call の結果を onToolExecuted で通知する", async () => {
+		const bridge = await createBridge();
+		const executed: McpToolExecutionRecord[] = [];
+		const registration = bridge.registerSession({
+			tools: [
+				{
+					name: "send_message",
+					description: "send",
+					parameters: { type: "object", properties: { content: { type: "string" } } },
+					execute: async () => ({ text: '{"messageId":"1"}', images: [], isError: false }),
+				},
+			],
+			getRunSignal: () => undefined,
+			onToolExecuted: (record) => {
+				executed.push(record);
+			},
+		});
+		const { url, headers } = registration.serverConfig;
+
+		await postJson(url, headers, {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: { name: "send_message", arguments: { content: "やあ" } },
+		});
+		await postJson(url, headers, {
+			jsonrpc: "2.0",
+			id: 2,
+			method: "tools/call",
+			params: { name: "unknown_tool", arguments: {} },
+		});
+
+		expect(executed).toEqual([
+			{
+				toolCallId: expect.stringMatching(/^mcp-/u),
+				name: "send_message",
+				arguments: { content: "やあ" },
+				result: { text: '{"messageId":"1"}', images: [], isError: false },
+			},
+			{
+				toolCallId: expect.stringMatching(/^mcp-/u),
+				name: "unknown_tool",
+				arguments: {},
+				result: { text: "Unknown tool: unknown_tool", images: [], isError: true },
+			},
+		]);
 	});
 });

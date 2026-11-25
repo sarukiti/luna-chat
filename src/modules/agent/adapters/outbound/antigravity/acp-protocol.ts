@@ -106,8 +106,12 @@ const acpSessionUpdateSchema = z.looseObject({
 	toolCallId: z.string().optional(),
 	name: z.string().optional(),
 	args: z.unknown().optional(),
+	rawInput: z.unknown().optional(),
+	rawOutput: z.unknown().optional(),
+	kind: z.string().optional(),
 	status: z.string().optional(),
 	title: z.string().optional(),
+	_meta: z.record(z.string(), z.unknown()).optional(),
 });
 
 export type AcpSessionUpdate = z.infer<typeof acpSessionUpdateSchema>;
@@ -117,16 +121,31 @@ export const acpSessionUpdateParamsSchema = z.looseObject({
 	update: acpSessionUpdateSchema,
 });
 
+const acpPermissionOptionSchema = z.looseObject({
+	optionId: z.string(),
+	name: z.string().optional(),
+	kind: z.string().optional(),
+});
+
+export type AcpPermissionOption = z.infer<typeof acpPermissionOptionSchema>;
+
+const acpPermissionToolCallSchema = z.looseObject({
+	toolCallId: z.string().optional(),
+	title: z.string().optional(),
+	kind: z.string().optional(),
+	name: z.string().optional(),
+	rawInput: z.unknown().optional(),
+	args: z.unknown().optional(),
+	_meta: z.record(z.string(), z.unknown()).optional(),
+});
+
 export const acpRequestPermissionParamsSchema = z.looseObject({
 	sessionId: z.string().optional(),
-	options: z
-		.array(
-			z.looseObject({
-				optionId: z.string(),
-			}),
-		)
-		.optional(),
+	toolCall: acpPermissionToolCallSchema.optional(),
+	options: z.array(acpPermissionOptionSchema).optional(),
 });
+
+export type AcpRequestPermissionParams = z.infer<typeof acpRequestPermissionParamsSchema>;
 
 export type AcpMcpServerConfig = Readonly<{
 	type: "http";
@@ -134,6 +153,62 @@ export type AcpMcpServerConfig = Readonly<{
 	url: string;
 	headers: readonly Readonly<{ name: string; value: string }>[];
 }>;
+
+export const LUNA_MCP_SERVER_NAME = "luna";
+
+const LUNA_MCP_TOOL_PREFIXES: readonly string[] = [
+	`mcp_${LUNA_MCP_SERVER_NAME}_`,
+	`${LUNA_MCP_SERVER_NAME}__`,
+	`${LUNA_MCP_SERVER_NAME}:`,
+	`${LUNA_MCP_SERVER_NAME}/`,
+];
+
+export function extractAcpToolName(
+	source: Readonly<{
+		name?: string | undefined;
+		title?: string | undefined;
+		_meta?: Readonly<Record<string, unknown>> | undefined;
+	}>,
+): string | undefined {
+	if (typeof source.name === "string" && source.name.trim() !== "") {
+		return source.name;
+	}
+	const metaToolName = source._meta?.["toolName"];
+	if (typeof metaToolName === "string" && metaToolName.trim() !== "") {
+		return metaToolName;
+	}
+	if (typeof source.title === "string" && source.title.trim() !== "") {
+		return source.title;
+	}
+	return undefined;
+}
+
+export function extractAcpToolArgs(
+	source: Readonly<{ args?: unknown; rawInput?: unknown }>,
+): unknown {
+	return source.args !== undefined ? source.args : source.rawInput;
+}
+
+export function resolveMcpToolName(
+	rawName: string | undefined,
+	mcpToolNames: ReadonlySet<string>,
+): string | undefined {
+	if (rawName === undefined || mcpToolNames.size === 0) {
+		return undefined;
+	}
+	if (mcpToolNames.has(rawName)) {
+		return rawName;
+	}
+	for (const prefix of LUNA_MCP_TOOL_PREFIXES) {
+		if (rawName.startsWith(prefix)) {
+			const stripped = rawName.slice(prefix.length);
+			if (mcpToolNames.has(stripped)) {
+				return stripped;
+			}
+		}
+	}
+	return undefined;
+}
 
 // session/new の configOptions（model / thought_level）と models.availableModels から
 // Luna のモデルカタログ（provider/model と対応する thinking 一覧）を組み立てる。

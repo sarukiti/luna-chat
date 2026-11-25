@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import type { LoggerPort } from "../../../../observability/ports/logger-port";
 import type { AgentTool, AgentToolResult } from "../../../ports/outbound/agent-session-port";
+import { LUNA_MCP_SERVER_NAME } from "./acp-protocol";
 import type { AcpMcpServerConfig } from "./acp-protocol";
 
 const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
@@ -27,11 +28,19 @@ const mcpToolCallParamsSchema = z.looseObject({
 	arguments: z.unknown().optional(),
 });
 
+export type McpToolExecutionRecord = Readonly<{
+	toolCallId: string;
+	name: string;
+	arguments: unknown;
+	result: AgentToolResult;
+}>;
+
 type RegisteredSession = Readonly<{
 	token: string;
 	tools: ReadonlyMap<string, AgentTool>;
 	toolList: readonly AgentTool[];
 	getRunSignal: () => AbortSignal | undefined;
+	onToolExecuted: ((record: McpToolExecutionRecord) => void) | undefined;
 }>;
 
 export type McpSessionRegistration = Readonly<{
@@ -85,6 +94,7 @@ export class LocalMcpBridge {
 	registerSession(input: {
 		tools: readonly AgentTool[];
 		getRunSignal: () => AbortSignal | undefined;
+		onToolExecuted?: (record: McpToolExecutionRecord) => void;
 	}): McpSessionRegistration {
 		if (this.#port === undefined) {
 			throw new Error("Local MCP bridge is not started");
@@ -103,11 +113,12 @@ export class LocalMcpBridge {
 			tools,
 			toolList: [...input.tools],
 			getRunSignal: input.getRunSignal,
+			onToolExecuted: input.onToolExecuted,
 		});
 		return {
 			serverConfig: {
 				type: "http",
-				name: "luna",
+				name: LUNA_MCP_SERVER_NAME,
 				url: `http://127.0.0.1:${String(this.#port)}/mcp/${routeId}`,
 				headers: [{ name: "authorization", value: `Bearer ${token}` }],
 			},
@@ -271,9 +282,16 @@ export class LocalMcpBridge {
 		argumentsValue: unknown,
 		request: IncomingMessage,
 	): Promise<AgentToolResult> {
+		const toolCallId = `mcp-${randomUUID()}`;
 		const tool = session.tools.get(name);
 		if (tool === undefined) {
-			return { text: `Unknown tool: ${name}`, images: [], isError: true };
+			const result: AgentToolResult = {
+				text: `Unknown tool: ${name}`,
+				images: [],
+				isError: true,
+			};
+			session.onToolExecuted?.({ toolCallId, name, arguments: argumentsValue, result });
+			return result;
 		}
 		const requestAbort = new AbortController();
 		const onClose = () => {
@@ -287,10 +305,11 @@ export class LocalMcpBridge {
 			runSignal === undefined
 				? requestAbort.signal
 				: AbortSignal.any([requestAbort.signal, runSignal]);
+		let result: AgentToolResult;
 		try {
-			return await tool.execute(argumentsValue, signal);
+			result = await tool.execute(argumentsValue, signal);
 		} catch (error: unknown) {
-			return {
+			result = {
 				text: error instanceof Error ? error.message : String(error),
 				images: [],
 				isError: true,
@@ -298,6 +317,8 @@ export class LocalMcpBridge {
 		} finally {
 			request.off("close", onClose);
 		}
+		session.onToolExecuted?.({ toolCallId, name, arguments: argumentsValue, result });
+		return result;
 	}
 }
 

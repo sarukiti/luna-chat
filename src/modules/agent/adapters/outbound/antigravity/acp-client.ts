@@ -19,6 +19,7 @@ import type {
 	AcpInitializeResult,
 	AcpMcpServerConfig,
 	AcpPromptResult,
+	AcpRequestPermissionParams,
 	AcpSessionNewResult,
 	AcpSessionUpdate,
 } from "./acp-protocol";
@@ -80,12 +81,20 @@ export type AcpClientPort = Readonly<{
 	close(): Promise<void>;
 }>;
 
+export type AcpPermissionOutcome =
+	| Readonly<{ outcome: "selected"; optionId: string }>
+	| Readonly<{ outcome: "cancelled" }>;
+
+export type AcpPermissionHandler = (params: AcpRequestPermissionParams) => AcpPermissionOutcome;
+
 export type StdioAcpClientOptions = Readonly<{
 	command?: string;
 	args?: readonly string[];
 	cwd: string;
 	geminiDir: string;
 	env?: Readonly<Record<string, string | undefined>>;
+	dangerouslySkipPermissions?: boolean;
+	onPermissionRequest?: AcpPermissionHandler;
 	logger: LoggerPort;
 }>;
 
@@ -97,6 +106,7 @@ type PendingRequest = Readonly<{
 export class StdioAcpClient implements AcpClientPort {
 	readonly #child: ChildProcess;
 	readonly #logger: LoggerPort;
+	readonly #onPermissionRequest: AcpPermissionHandler | undefined;
 	readonly #pending = new Map<number, PendingRequest>();
 	readonly #listeners = new Map<string, Set<(update: AcpSessionUpdate) => void>>();
 	readonly #idleResetters = new Map<string, Set<() => void>>();
@@ -109,11 +119,12 @@ export class StdioAcpClient implements AcpClientPort {
 
 	constructor(options: StdioAcpClientOptions) {
 		this.#logger = options.logger;
+		this.#onPermissionRequest = options.onPermissionRequest;
 		const command = options.command ?? "agy";
 		const args = options.args ?? [
 			"acp",
 			"--stdio",
-			"--dangerously-skip-permissions",
+			...((options.dangerouslySkipPermissions ?? true) ? ["--dangerously-skip-permissions"] : []),
 			"--include-default-customizations=false",
 			"--gemini-dir",
 			options.geminiDir,
@@ -442,13 +453,19 @@ export class StdioAcpClient implements AcpClientPort {
 				if (permission.success && permission.data.sessionId !== undefined) {
 					this.#touchSession(permission.data.sessionId);
 				}
-				const optionId = permission.success ? permission.data.options?.[0]?.optionId : undefined;
+				const outcome: AcpPermissionOutcome =
+					permission.success && this.#onPermissionRequest !== undefined
+						? this.#onPermissionRequest(permission.data)
+						: {
+								outcome: "selected",
+								optionId:
+									(permission.success ? permission.data.options?.[0]?.optionId : undefined) ??
+									"allow",
+							};
 				this.#write({
 					jsonrpc: "2.0",
 					id: message.id,
-					result: {
-						outcome: { outcome: "selected", optionId: optionId ?? "allow" },
-					},
+					result: { outcome },
 				});
 				return;
 			}

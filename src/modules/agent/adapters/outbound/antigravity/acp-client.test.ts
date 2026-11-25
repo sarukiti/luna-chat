@@ -26,7 +26,12 @@ afterEach(async () => {
 	);
 });
 
-async function spawnFakeAcp(scriptSource: string): Promise<StdioAcpClient> {
+async function spawnFakeAcp(
+	scriptSource: string,
+	options: Readonly<{
+		onPermissionRequest?: ConstructorParameters<typeof StdioAcpClient>[0]["onPermissionRequest"];
+	}> = {},
+): Promise<StdioAcpClient> {
 	const dir = await mkdtemp(path.join(tmpdir(), "acp-client-test-"));
 	temporaryDirectories.push(dir);
 	const scriptPath = path.join(dir, "fake-acp.mjs");
@@ -36,6 +41,7 @@ async function spawnFakeAcp(scriptSource: string): Promise<StdioAcpClient> {
 		args: [scriptPath],
 		cwd: dir,
 		geminiDir: dir,
+		onPermissionRequest: options.onPermissionRequest,
 		logger: createRecordingLogger(),
 	});
 	clients.push(client);
@@ -176,6 +182,76 @@ rl.on("line", (line) => {
 		await expect(
 			client.prompt("sess-idle", "stall-after-one", { timeoutMs: 80 }),
 		).rejects.toBeInstanceOf(AcpTimeoutError);
+	});
+
+	it("onPermissionRequest を指定すると権限リクエストの応答をカスタマイズできる", async () => {
+		const seenTools: string[] = [];
+		const client = await spawnFakeAcp(
+			`
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+let pendingPromptId = null;
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/prompt") {
+    pendingPromptId = msg.id;
+    send({
+      jsonrpc: "2.0",
+      id: 901,
+      method: "session/request_permission",
+      params: {
+        sessionId: "sess-p",
+        toolCall: { toolCallId: "tc-1", name: "write_file", kind: "edit" },
+        options: [
+          { optionId: "allow_once", kind: "allow_once" },
+          { optionId: "reject_once", kind: "reject_once" },
+        ],
+      },
+    });
+  } else if (msg.id === 901 && msg.result) {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "sess-p",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "判定:" + msg.result.outcome.optionId },
+        },
+      },
+    });
+    send({ jsonrpc: "2.0", id: pendingPromptId, result: { stopReason: "end_turn" } });
+  }
+});
+`,
+			{
+				onPermissionRequest: (params) => {
+					if (params.toolCall?.name !== undefined) {
+						seenTools.push(params.toolCall.name);
+					}
+					return { outcome: "selected", optionId: "reject_once" };
+				},
+			},
+		);
+
+		await client.initialize();
+		const updates: AcpSessionUpdate[] = [];
+		const unsubscribe = client.subscribe("sess-p", (update) => {
+			updates.push(update);
+		});
+		await client.prompt("sess-p", "write");
+		unsubscribe();
+
+		expect(seenTools).toEqual(["write_file"]);
+		expect(updates).toEqual([
+			{
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "判定:reject_once" },
+			},
+		]);
 	});
 });
 

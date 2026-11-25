@@ -325,9 +325,159 @@ describe("AntigravityAcpRuntime と AntigravityAgentSession", () => {
 			"session_open",
 			"message",
 			"message",
-			"tool_call",
+			"message",
 			"message",
 		]);
+		expect(lines[3]).toMatchObject({
+			type: "message",
+			message: {
+				role: "assistant",
+				stopReason: "toolUse",
+				content: [
+					{
+						type: "toolCall",
+						id: "t1",
+						name: "read_file",
+						arguments: { Path: ".agents/skills/cron/SKILL.md" },
+					},
+				],
+			},
+		});
+		expect(lines[4]).toMatchObject({
+			type: "message",
+			message: {
+				role: "assistant",
+				stopReason: "end_turn",
+				content: [{ type: "text", text: "こんにちは" }],
+			},
+		});
+	});
+
+	it("MCPツール実行を pi 互換の assistant(toolCall)+toolResult で記録し、ACP側通知と二重記録しない", async () => {
+		const recordedBuiltins: Array<{ name: string; args: unknown }> = [];
+		const client = new FakeAcpClient({
+			onPrompt: async (_sid, _text, emit) => {
+				const mcpServer = client.newSessionCalls.at(-1)?.mcpServers[0];
+				if (mcpServer === undefined) throw new Error("mcp server missing");
+				// ACP 側からもプレフィックス付き通知が届くケースを再現する。
+				emit({
+					sessionUpdate: "tool_call",
+					toolCallId: "acp-mcp-1",
+					name: "mcp_luna_send_message",
+					rawInput: { content: "おはよう" },
+					status: "pending",
+				});
+				const response = await fetch(mcpServer.url, {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						...Object.fromEntries(mcpServer.headers.map((header) => [header.name, header.value])),
+					},
+					body: JSON.stringify({
+						jsonrpc: "2.0",
+						id: 1,
+						method: "tools/call",
+						params: {
+							name: "send_message",
+							arguments: { target: { kind: "channel", channelId: "1" }, content: "おはよう" },
+						},
+					}),
+				});
+				expect(response.status).toBe(200);
+				emit({
+					sessionUpdate: "tool_call_update",
+					toolCallId: "acp-mcp-1",
+					status: "completed",
+					rawOutput: '{"messageId":"42"}',
+				});
+				// 組み込みツールは tool_call → tool_call_update の2段階で届くケースを再現する。
+				emit({
+					sessionUpdate: "tool_call",
+					toolCallId: "builtin-1",
+					name: "read_file",
+					status: "pending",
+				});
+				emit({
+					sessionUpdate: "tool_call_update",
+					toolCallId: "builtin-1",
+					rawInput: { Path: ".agents/skills/heartbeat/SKILL.md" },
+					rawOutput: "# Heartbeat",
+					status: "completed",
+				});
+				return { stopReason: "end_turn" };
+			},
+		});
+		const { runtime, root } = await setup({
+			clientFactory: () => client,
+			onSkillToolCall: (name, args) => {
+				recordedBuiltins.push({ name, args });
+			},
+		});
+
+		const sendMessageTool: AgentTool = {
+			name: "send_message",
+			description: "send message",
+			parameters: { type: "object", properties: { content: { type: "string" } } },
+			execute: async () => ({ text: '{"messageId":"42"}', images: [], isError: false }),
+		};
+		const session = runtime.open(sessionSpec({ tools: [sendMessageTool] }));
+		await session.run([{ kind: "discord_message", text: '{"msg":"hi"}' }]);
+		await session.close();
+
+		// 組み込みの read_file のみ1回だけ通知され、MCP の send_message は重複通知されない。
+		expect(recordedBuiltins).toEqual([
+			{ name: "read_file", args: { Path: ".agents/skills/heartbeat/SKILL.md" } },
+		]);
+
+		const lines = await readTranscript(root, session.id);
+		const messages = lines
+			.filter((line) => line.type === "message")
+			.map((line) => z.looseObject({ role: z.string() }).parse(line["message"]));
+		expect(messages.map((message) => message.role)).toEqual([
+			"system",
+			"luna_input",
+			"assistant",
+			"toolResult",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(messages[2]).toMatchObject({
+			role: "assistant",
+			stopReason: "toolUse",
+			content: [
+				{
+					type: "toolCall",
+					name: "send_message",
+					arguments: { target: { kind: "channel", channelId: "1" }, content: "おはよう" },
+				},
+			],
+		});
+		expect(messages[3]).toMatchObject({
+			role: "toolResult",
+			toolName: "send_message",
+			content: [{ type: "text", text: '{"messageId":"42"}' }],
+			isError: false,
+		});
+		expect(messages[4]).toMatchObject({
+			role: "assistant",
+			stopReason: "toolUse",
+			content: [
+				{
+					type: "toolCall",
+					id: "builtin-1",
+					name: "read_file",
+					arguments: { Path: ".agents/skills/heartbeat/SKILL.md" },
+				},
+			],
+		});
+		expect(messages[5]).toMatchObject({
+			role: "toolResult",
+			toolCallId: "builtin-1",
+			toolName: "read_file",
+			content: [{ type: "text", text: "# Heartbeat" }],
+			isError: false,
+		});
 	});
 
 	it("実行中の run は SessionBusyError、閉じた後は SessionClosedError にする", async () => {
