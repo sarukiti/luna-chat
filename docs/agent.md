@@ -4,12 +4,13 @@
 
 ## モデルの提供元
 
-エージェントは、Lunaのプロセス内でpi（`@earendil-works/pi-agent-core` と `@earendil-works/pi-ai`）を使って実行する。モデルの提供元は次の2つで、`[models]` ごとに選べる。
+エージェントは、モデルの提供元に応じて次のいずれかで実行する。`[models]` ごとに選べる。
 
-- `openai-codex`: ChatGPTのサブスクリプションをOAuthで使う。
-- `claude-code`: Claudeのサブスクリプション（Pro・Max）を、Claude Code CLI を通して使う。モデルは `claude-fable-5-2`・`claude-opus-5-5`・`claude-sonnet-5-5`・`claude-haiku-5-5`。
+- `openai-codex`: Luna のプロセス内で pi（`@earendil-works/pi-agent-core` と `@earendil-works/pi-ai`）を使い、ChatGPT のサブスクリプションを OAuth で使う。
+- `claude-code`: pi を通して、Claude のサブスクリプション（Pro・Max）を Claude Code CLI で使う。モデルは `claude-fable-5-2`・`claude-opus-5-5`・`claude-sonnet-5-5`・`claude-haiku-5-5`。
+- `antigravity`: Google Antigravity CLI の ACP サーバー（`agy acp`）を子プロセスで動かして使う。モデルと推論強度のカタログは、`[models]` に `antigravity/*` が含まれるとき起動時に `agy acp` から取得する。音声モードの表（`[models.voice]`）は `antigravity` に未対応とし、指定された場合は起動を中止する。
 
-会話・イベント実行は、それぞれ `[models]` で指定したモデルと推論強度を使う。会話は `/luna model` でセッションごとに変更できる。作業エージェントは依頼元が `task_create` で選んだもの（[tasks.md](./tasks.md)）、Minecraftの種類の作業エージェントは `[models.minecraft]`（[minecraft.md](./minecraft.md)）、音声モードの返事は `[models.voice]` を使う。
+会話・イベント実行は、それぞれ `[models]` で指定したモデルと推論強度を使う。会話は `/luna model` でセッションごとに変更できる（開いているセッションの提供元を `antigravity` と他プロバイダの間でまたぐ変更は不可）。作業エージェントは依頼元が `task_create` で選んだもの（[tasks.md](./tasks.md)）、Minecraftの種類の作業エージェントは `[models.minecraft]`（[minecraft.md](./minecraft.md)）、音声モードの返事は `[models.voice]` を使う。
 
 ## システムプロンプト
 
@@ -25,16 +26,17 @@
 - モデルへの各リクエストには `request_timeout_ms` を適用する。
 - 一時的な失敗（HTTP 5xx、接続の失敗・切断、タイムアウト）は、15秒・60秒・180秒待って最大3回、同じセッションの続きから再実行する。待機中に届いた割り込み入力は、再実行の前に入る。使用枠の上限到達（HTTP 429 の `usage_limit_reached`、`claude-code` の超過課金の拒否）、認証の失敗、それ以外の失敗は再実行しない。
 - 成功した応答に提供元の障害の診断情報（WebSocketが使えずSSEで送り直した等）が付いていたら、warnログ `agent.pi.provider_diagnostic` に種類・詳細・エラーメッセージを記録する。障害を伴わない診断情報（`claude-code` の再生用の状態や使用枠の状態）は記録しない。
-- 直近のリクエストの入力トークン数がモデルの文脈長から予約分（16384トークン）を引いた値を超えたら、`[models.compaction]` のモデルで古い部分を要約し、以後のリクエストでは「システムプロンプト、要約、直近の約20000トークン分」を送る。
+- 直近のリクエストの入力トークン数がモデルの文脈長から予約分（16384トークン）を引いた値を超えたら、`[models.compaction]` のモデルで古い部分を要約し、以後のリクエストでは「システムプロンプト、要約、直近の約20000トークン分」を送る（`antigravity` セッションは Antigravity 側の圧縮に任せるため `[models.compaction]` を使わない）。
 - セッションの記録は [SPEC.md](./SPEC.md) の「記録の保持」のとおり追記する。
 
 ## 認証と使用枠
 
 - ChatGPTの資格情報は `LUNA_HOME/auth/credentials.json`（ディレクトリは0700、ファイルは0600）に保存する。`luna-chat login` を実行すると、デバイスコード方式でログインして保存する。表示されたコードを任意の端末のブラウザで入力する。
 - アクセストークンは期限の5分前からリクエストの直前に更新する。更新に失敗した実行は再試行せずに失敗とし、エラーログを記録する。次に実行が成功するまで、ダッシュボードに再ログインが必要であることを示す。
-- 使用枠は起動時と以後10分ごとに取得し、`LUNA_HOME/state/usage.json` に書き出してダッシュボードに表示する。書き出す内容は `UsageSnapshot`（取得時刻、プラン、limitごとのprimary・secondaryウィンドウの使用率・長さ・リセット時刻）とする。
+- 使用枠は `[models]` に `openai-codex/*` が含まれる場合のみ、起動時と以後10分ごとに取得し、`LUNA_HOME/state/usage.json` に書き出してダッシュボードに表示する。書き出す内容は `UsageSnapshot`（取得時刻、プラン、limitごとのprimary・secondaryウィンドウの使用率・長さ・リセット時刻）とする。
 - `claude-code` は、Lunaのプロセスと同じユーザーで `claude`（Claude Code CLI）がPATHにあることを前提とする。Claude Codeの設定ディレクトリには `LUNA_HOME/claude-code` を使い（`CLAUDE_CONFIG_DIR`）、ログインは `CLAUDE_CONFIG_DIR=$LUNA_HOME/claude-code claude auth login` で行う。エージェントがシェルから使う `claude` には渡さず、そちらは通常の設定ディレクトリを使う。資格情報はClaude Codeが持ち、Lunaは読まない。`ANTHROPIC_API_KEY` はClaude Codeへ渡さず、認証や接続先を差し替える環境変数（`ANTHROPIC_AUTH_TOKEN`・`ANTHROPIC_BASE_URL`・Bedrock・Vertex・Foundry）があればリクエストを失敗とする。未インストール・未ログインもその実行の失敗とし、ダッシュボードの認証状態（ChatGPTのもの）は変えない。
 - `claude-code` の応答がプランの枠ではなく超過課金（usage credits）に回されたら、その実行を失敗にして以後のリクエストを止める。Anthropicが超過課金を求めて拒否した場合も同じ。使用枠の取得と表示、高速モード（[voice.md](./voice.md)）は `openai-codex` だけが対象である。
+- `antigravity` は、Lunaのプロセスと同じユーザーで `agy`（Google Antigravity CLI）が PATH にあることを前提とする。設定・認証ディレクトリには `LUNA_HOME/antigravity` を使い（`--gemini-dir`）、ログインは `agy acp --login --gemini-dir "$LUNA_HOME/antigravity"` で行う。エージェントがシェルから使う `agy` にはこのディレクトリを渡さず、通常の設定ディレクトリを使う。`[models]` に `openai-codex/*` がなく `antigravity/*` を使う場合、ダッシュボードの認証状態は Antigravity の認証状態を表す。
 
 ## 再生
 
@@ -95,6 +97,26 @@ PiAgentSession ─► Models.streamSimple ─► claude-code provider
 - 応答のネイティブの内容（署名付きの思考を含む）は assistant メッセージの diagnostics（`claude-code.native-assistant.v1`）に載せ、次の再生で使う。そのぶんセッションの記録が大きくなる。
 - モデルの一覧は静的で、pi-ai の anthropic のカタログから写し、料金は0にする。文脈長（1M）と最大出力（128K）は、Max のアカウントで Claude Code が報告する値と一致する。
 - `rate_limit_event` の `isUsingOverage` が立った応答と、超過課金を求める拒否は「Claude Code billing」で始まるエラーにし、`classifyAgentError` が `usage_limit` に分類する。
+
+### Antigravity（ACP）ランタイム
+
+```text
+CompositeAgentRuntime
+  ├─ provider !== "antigravity" ─► PiAgentRuntime
+  └─ provider === "antigravity" ─► AntigravityAcpRuntime
+                                      ├─ AcpClient ─► agy acp --stdio（子プロセス）
+                                      │                 ├─ 組み込みツール（ファイル・画像閲覧・Web検索・画像生成）
+                                      │                 └─ MCP（Streamable HTTP）
+                                      └─ LocalMcpBridge（127.0.0.1、セッション単位ルート＋Bearer認証）
+                                                          └─ Lunaツール＋シェルツール（バックグラウンド実行含む）
+```
+
+- `AntigravityAcpRuntime` は `AgentRuntimePort` を実装し、`agy acp --stdio --dangerously-skip-permissions --include-default-customizations=false --gemini-dir <LUNA_HOME/antigravity> --app-data-dir antigravity-cli` をワークスペースを `cwd` として 1 プロセス起動して共有する。
+- 起動時に `initialize` と検証用の `session/new`（直後に `session/close`）を実行してモデルと `thought_level` のカタログを取得する。
+- セッション開始時は、`session/new` の `_meta.antigravity.systemPrompt.append` にシステムプロンプト（一時ディレクトリとツール使い分けの案内を末尾に追記したもの）を渡し、`additionalDirectories` に一時ディレクトリ、`mcpServers` にローカル HTTP MCP サーバーのセッション専用 URL を渡す。
+- Luna 固有のツール（Discord・タスク・HTTP応答・Home Assistant・待機等）と `createShellTools`（`exec_command`・`write_stdin`・`stop_background` とバックグラウンド実行の `background_exit` 通知）は `LocalMcpBridge` 経由で Luna プロセス内で実行する。ファイル読み書き・画像閲覧・Web検索・画像生成は `agy acp` の組み込みツールに委ねる。
+- 実行中の割り込み入力（`steer`）は、同じ `sessionId` に対する並行の `session/prompt` として送り、実行の完了時は初期 `session/prompt` と実行中に送った全 `steer` の応答が揃うのを待つ。中断（`abort`）とタイムアウトでは `session/cancel` を送る。
+- 記録は `pi` と同じ `TranscriptWriter` を使い、`session_open`・入力・モデル変更・応答・ツール呼び出しを `LUNA_HOME/sessions/<YYYY-MM-DD>/<セッションID>.jsonl` に追記する。
 
 ### モデルの応答のストリーム
 
