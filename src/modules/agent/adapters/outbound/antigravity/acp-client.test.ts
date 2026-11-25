@@ -135,6 +135,48 @@ rl.on("line", (line) => {
 		await expect(client.prompt("s", "crash")).rejects.toThrow("Antigravity ACP exited with code 1");
 		expect(client.isAlive()).toBe(false);
 	});
+
+	it("prompt は session/update が届き続ける間はタイムアウトをリセットし、無応答が続いた時だけタイムアウトする", async () => {
+		const client = await spawnFakeAcp(`
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/prompt") {
+    const sid = msg.params.sessionId;
+    const text = msg.params.prompt[0].text;
+    if (text === "active") {
+      let count = 0;
+      const timer = setInterval(() => {
+        count += 1;
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: String(count) } } } });
+        if (count >= 4) {
+          clearInterval(timer);
+          send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+        }
+      }, 40);
+    } else if (text === "stall-after-one") {
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "once" } } } });
+      }, 30);
+    }
+  }
+});
+`);
+
+		await client.initialize();
+		// 40ms × 4回 = 160ms かかるが、各間隔が timeoutMs(100ms) 未満なので完了する。
+		const ok = await client.prompt("sess-idle", "active", { timeoutMs: 100 });
+		expect(ok.stopReason).toBe("end_turn");
+
+		// 1回だけ通知したあと無応答が続けば timeoutMs 後にタイムアウトする。
+		await expect(
+			client.prompt("sess-idle", "stall-after-one", { timeoutMs: 80 }),
+		).rejects.toBeInstanceOf(AcpTimeoutError);
+	});
 });
 
 describe("classifyAcpError", () => {

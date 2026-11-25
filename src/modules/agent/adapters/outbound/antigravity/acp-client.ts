@@ -99,6 +99,7 @@ export class StdioAcpClient implements AcpClientPort {
 	readonly #logger: LoggerPort;
 	readonly #pending = new Map<number, PendingRequest>();
 	readonly #listeners = new Map<string, Set<(update: AcpSessionUpdate) => void>>();
+	readonly #idleResetters = new Map<string, Set<() => void>>();
 	readonly #exited: Promise<void>;
 
 	#nextId = 1;
@@ -222,7 +223,7 @@ export class StdioAcpClient implements AcpClientPort {
 				prompt: [{ type: "text", text }],
 			},
 			acpPromptResultSchema,
-			options,
+			{ ...options, idleSessionId: sessionId },
 		);
 	}
 
@@ -291,7 +292,7 @@ export class StdioAcpClient implements AcpClientPort {
 		method: string,
 		params: Readonly<Record<string, unknown>>,
 		schema: z.ZodType<T>,
-		options?: Readonly<{ signal?: AbortSignal; timeoutMs?: number }>,
+		options?: Readonly<{ signal?: AbortSignal; timeoutMs?: number; idleSessionId?: string }>,
 	): Promise<T> {
 		options?.signal?.throwIfAborted();
 		if (this.#exitError !== undefined) {
@@ -303,8 +304,10 @@ export class StdioAcpClient implements AcpClientPort {
 		const raw = await new Promise<unknown>((resolveRequest, rejectRequest) => {
 			let settled = false;
 			let timer: NodeJS.Timeout | undefined;
+			let unregisterIdle: (() => void) | undefined;
 			const cleanup = () => {
 				if (timer !== undefined) clearTimeout(timer);
+				unregisterIdle?.();
 				options?.signal?.removeEventListener("abort", onAbort);
 				this.#pending.delete(id);
 			};
@@ -322,16 +325,24 @@ export class StdioAcpClient implements AcpClientPort {
 					);
 				});
 			};
-			if (options?.timeoutMs !== undefined) {
-				timer = setTimeout(() => {
-					finish(() => {
-						rejectRequest(
-							new AcpTimeoutError(
-								`Antigravity ACP ${method} timed out after ${String(options.timeoutMs)}ms`,
-							),
-						);
-					});
-				}, options.timeoutMs);
+			const timeoutMs = options?.timeoutMs;
+			if (timeoutMs !== undefined) {
+				const armTimer = () => {
+					if (timer !== undefined) clearTimeout(timer);
+					timer = setTimeout(() => {
+						finish(() => {
+							rejectRequest(
+								new AcpTimeoutError(
+									`Antigravity ACP ${method} timed out after ${String(timeoutMs)}ms`,
+								),
+							);
+						});
+					}, timeoutMs);
+				};
+				armTimer();
+				if (options?.idleSessionId !== undefined) {
+					unregisterIdle = this.#registerIdleResetter(options.idleSessionId, armTimer);
+				}
 			}
 			options?.signal?.addEventListener("abort", onAbort, { once: true });
 			this.#pending.set(id, {
@@ -412,6 +423,7 @@ export class StdioAcpClient implements AcpClientPort {
 			if (message.method === "session/update") {
 				const update = acpSessionUpdateParamsSchema.safeParse(message.params);
 				if (update.success) {
+					this.#touchSession(update.data.sessionId);
 					const listeners = this.#listeners.get(update.data.sessionId);
 					if (listeners !== undefined) {
 						for (const listener of listeners) {
@@ -427,6 +439,9 @@ export class StdioAcpClient implements AcpClientPort {
 		if (message.method !== undefined && message.id !== undefined) {
 			if (message.method === "session/request_permission") {
 				const permission = acpRequestPermissionParamsSchema.safeParse(message.params);
+				if (permission.success && permission.data.sessionId !== undefined) {
+					this.#touchSession(permission.data.sessionId);
+				}
 				const optionId = permission.success ? permission.data.options?.[0]?.optionId : undefined;
 				this.#write({
 					jsonrpc: "2.0",
@@ -442,6 +457,29 @@ export class StdioAcpClient implements AcpClientPort {
 				id: message.id,
 				error: { code: -32_601, message: `Method not found: ${message.method}` },
 			});
+		}
+	}
+
+	#registerIdleResetter(sessionId: string, reset: () => void): () => void {
+		let set = this.#idleResetters.get(sessionId);
+		if (set === undefined) {
+			set = new Set();
+			this.#idleResetters.set(sessionId, set);
+		}
+		set.add(reset);
+		return () => {
+			set.delete(reset);
+			if (set.size === 0) {
+				this.#idleResetters.delete(sessionId);
+			}
+		};
+	}
+
+	#touchSession(sessionId: string): void {
+		const set = this.#idleResetters.get(sessionId);
+		if (set === undefined) return;
+		for (const reset of set) {
+			reset();
 		}
 	}
 
