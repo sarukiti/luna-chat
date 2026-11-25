@@ -116,7 +116,7 @@ CompositeAgentRuntime
 - セッション開始時は、`session/new` の `_meta.antigravity.systemPrompt.append` にシステムプロンプト（一時ディレクトリとツール使い分けの案内を末尾に追記したもの）を渡し、`additionalDirectories` に一時ディレクトリ、`mcpServers` にローカル HTTP MCP サーバーのセッション専用 URL を渡す。
 - Luna 固有のツール（Discord・タスク・HTTP応答・Home Assistant・待機等）と `createShellTools`（`exec_command`・`write_stdin`・`stop_background` とバックグラウンド実行の `background_exit` 通知）は `LocalMcpBridge` 経由で Luna プロセス内で実行する。ファイル読み書き・画像閲覧・Web検索・画像生成は `agy acp` の組み込みツールに委ねる。
 - 実行中の割り込み入力（`steer`）は、同じ `sessionId` に対する並行の `session/prompt` として送り、実行の完了時は初期 `session/prompt` と実行中に送った全 `steer` の応答が揃うのを待つ。中断（`abort`）とタイムアウトでは `session/cancel` を送る。`session/prompt` の `request_timeout_ms` は、該当セッションの `session/update` や `session/request_permission` が届くたびにリセットする無応答タイムアウトとして適用する。
-- 記録は `pi` と同じ `TranscriptWriter` を使い、`session_open`・入力・モデル変更・応答・ツール呼び出しを `LUNA_HOME/sessions/<YYYY-MM-DD>/<セッションID>.jsonl` に追記する。
+- 記録は `pi` と同じ `TranscriptWriter` を使い、`session_open`・入力・モデル変更・応答・ツール呼び出しと結果（`pi` と同じ `assistant` の `toolCall` ブロックと `toolResult` メッセージ）を `LUNA_HOME/sessions/<YYYY-MM-DD>/<セッションID>.jsonl` に追記する。MCP 経由のツール呼び出しは `LocalMcpBridge` の実行フックで正確な引数・結果を記録し、ACP の `session/update` からの重複記録を避ける。
 
 ### モデルの応答のストリーム
 
@@ -124,6 +124,6 @@ CompositeAgentRuntime
 
 ### 再生
 
-- `luna-chat replay` は、常駐プロセスとは別のプロセスで `PiAgentRuntime` を作り、場面ごと・指示の組ごとにセッションを開いて閉じる。会話の開発者指示は常駐側と同じものを使う。
-- Lunaのツールは本物の定義を、ポートだけ記録用の偽物に差し替えて組み立てる。
+- `luna-chat replay` は、常駐プロセスとは別のプロセスで、`[models.conversation]` の提供元に応じたランタイム（`antigravity` なら `AntigravityAcpRuntime`、それ以外は `PiAgentRuntime`）を作り、場面ごと・指示の組ごとにセッションを開いて閉じる。会話の開発者指示は常駐側と同じものを使う。
+- Lunaのツールは本物の定義を、ポートだけ記録用の偽物に差し替えて組み立てる。`antigravity` では、`exec_command`・`write_stdin`・`stop_background`・`edit`・`write`・`image_gen` も記録用の MCP スタブとして渡し、`agy acp` を `--dangerously-skip-permissions` なしで起動して `session/request_permission` で読み取り系と MCP 以外の組み込みツール（ファイル書き込み・コマンド実行等）を拒否する。
 - 記録は一時ディレクトリへ書き、終了時に消す。本物の会話記録に混ぜると、エージェントが次に記録を見直す時に再生を本物の会話と取り違えるため。
