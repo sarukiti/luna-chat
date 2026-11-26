@@ -23,7 +23,7 @@ export function createLunaInputMessage(
 	return { role: "luna_input", kind: input.kind, text: input.text, timestamp };
 }
 
-function formatLunaInput(message: LunaInputMessage): string {
+export function formatLunaInput(message: AgentInputMessage): string {
 	// 本文はJSONなので、`</` を同じ意味の `<\/` にしてDiscordの投稿などから外側のタグを閉じられないようにする。
 	return `<luna_input kind="${escapeAttribute(message.kind)}">\n${message.text.replaceAll("</", "<\\/")}\n</luna_input>`;
 }
