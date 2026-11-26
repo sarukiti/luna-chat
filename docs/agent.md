@@ -33,9 +33,9 @@
 
 - ChatGPTの資格情報は `LUNA_HOME/auth/credentials.json`（ディレクトリは0700、ファイルは0600）に保存する。`luna-chat login` を実行すると、デバイスコード方式でログインして保存する。表示されたコードを任意の端末のブラウザで入力する。
 - アクセストークンは期限の5分前からリクエストの直前に更新する。更新に失敗した実行は再試行せずに失敗とし、エラーログを記録する。次に実行が成功するまで、ダッシュボードに再ログインが必要であることを示す。
-- 使用枠は `[models]` に `openai-codex/*` が含まれる場合のみ、起動時と以後10分ごとに取得し、`LUNA_HOME/state/usage.json` に書き出してダッシュボードに表示する。書き出す内容は `UsageSnapshot`（取得時刻、プラン、limitごとのprimary・secondaryウィンドウの使用率・長さ・リセット時刻）とする。
+- 使用枠は `[models]` に `openai-codex/*` または `antigravity/*` が含まれる場合、起動時と以後10分ごとに取得し、`LUNA_HOME/state/usage.json` に書き出してダッシュボードに表示する。書き出す内容は `UsageSnapshot`（取得時刻、プラン、limitごとのprimary・secondaryウィンドウの使用率・長さ・リセット時刻）とする。`antigravity/*` では `agy -p /usage --output-format json`（`LUNA_HOME/antigravity` を認証ディレクトリとして使用）の出力を変換し、両方を使う場合は各プロバイダの使用枠を統合する。
 - `claude-code` は、Lunaのプロセスと同じユーザーで `claude`（Claude Code CLI）がPATHにあることを前提とする。Claude Codeの設定ディレクトリには `LUNA_HOME/claude-code` を使い（`CLAUDE_CONFIG_DIR`）、ログインは `CLAUDE_CONFIG_DIR=$LUNA_HOME/claude-code claude auth login` で行う。エージェントがシェルから使う `claude` には渡さず、そちらは通常の設定ディレクトリを使う。資格情報はClaude Codeが持ち、Lunaは読まない。`ANTHROPIC_API_KEY` はClaude Codeへ渡さず、認証や接続先を差し替える環境変数（`ANTHROPIC_AUTH_TOKEN`・`ANTHROPIC_BASE_URL`・Bedrock・Vertex・Foundry）があればリクエストを失敗とする。未インストール・未ログインもその実行の失敗とし、ダッシュボードの認証状態（ChatGPTのもの）は変えない。
-- `claude-code` の応答がプランの枠ではなく超過課金（usage credits）に回されたら、その実行を失敗にして以後のリクエストを止める。Anthropicが超過課金を求めて拒否した場合も同じ。使用枠の取得と表示、高速モード（[voice.md](./voice.md)）は `openai-codex` だけが対象である。
+- `claude-code` の応答がプランの枠ではなく超過課金（usage credits）に回されたら、その実行を失敗にして以後のリクエストを止める。Anthropicが超過課金を求めて拒否した場合も同じ。使用枠の取得と表示は `openai-codex` と `antigravity`、高速モード（[voice.md](./voice.md)）は `openai-codex` が対象である。
 - `antigravity` は、Lunaのプロセスと同じユーザーで `agy`（Google Antigravity CLI）が PATH にあることを前提とする。設定・認証ディレクトリには `LUNA_HOME/antigravity` を使い（`--gemini-dir`）、ログインは `agy acp --login --gemini-dir "$LUNA_HOME/antigravity"` で行う。エージェントがシェルから使う `agy` にはこのディレクトリを渡さず、通常の設定ディレクトリを使う。`[models]` に `openai-codex/*` がなく `antigravity/*` を使う場合、ダッシュボードの認証状態は Antigravity の認証状態を表す。
 
 ## 再生
