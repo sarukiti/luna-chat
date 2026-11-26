@@ -7,7 +7,20 @@ import type { Models, Provider } from "@earendil-works/pi-ai/models";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 
-import { ANTIGRAVITY_PROVIDER_ID } from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
+import type {
+	AcpClientPort,
+	AcpPermissionOutcome,
+} from "../modules/agent/adapters/outbound/antigravity/acp-client";
+import {
+	ANTIGRAVITY_PROVIDER_ID,
+	extractAcpToolName,
+	LUNA_MCP_SERVER_NAME,
+	resolveMcpToolName,
+} from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
+import type {
+	AcpPermissionOption,
+	AcpRequestPermissionParams,
+} from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
 import { AntigravityAcpRuntime } from "../modules/agent/adapters/outbound/antigravity/antigravity-agent-runtime";
 import { ChatGptBackend } from "../modules/agent/adapters/outbound/pi/chatgpt-backend";
 import { claudeCodeProvider } from "../modules/agent/adapters/outbound/pi/claude-code/provider";
@@ -49,7 +62,7 @@ function claudeCodeConfigDir(lunaHomeDir: string): string {
 	return resolve(lunaHomeDir, "claude-code");
 }
 
-function antigravityDir(lunaHomeDir: string): string {
+export function antigravityDir(lunaHomeDir: string): string {
 	return resolve(lunaHomeDir, "antigravity");
 }
 
@@ -338,6 +351,106 @@ function observeSkillUse(
 	};
 }
 
+const REPLAY_STUBBED_HARNESS_TOOLS: readonly HarnessToolName[] = [
+	"exec_command",
+	"write_stdin",
+	"stop_background",
+	"edit",
+	"write",
+	"image_gen",
+];
+
+const REPLAY_ANTIGRAVITY_ROUTING_INSTRUCTIONS =
+	"This is a replay session. For Discord, task management, HTTP responses, Assist, and wait, always use the corresponding MCP tools. For exec_command, write_stdin, stop_background, edit, write, and image_gen, always use the MCP tools (they are recorded stubs and must not be replaced by built-in write, edit, command, or image generation tools). Only use built-in tools for reading files, viewing images, and web search.";
+
+const REPLAY_ALLOWED_PERMISSION_KINDS = new Set(["read", "search", "fetch"]);
+const REPLAY_DENIED_PERMISSION_KINDS = new Set(["edit", "delete", "execute"]);
+const REPLAY_ALLOWED_BUILTIN_TOOL_NAMES = new Set([
+	"read",
+	"read_file",
+	"view_file",
+	"view_file_outline",
+	"view_code_item",
+	"view_image",
+	"search_web",
+	"web_search",
+	"web_run",
+	"grep_search",
+	"find_by_name",
+	"list_dir",
+	"read_url_content",
+]);
+
+// replay では組み込みの書き込み・コマンド実行を外へ作用させないよう、MCP ツールと読み取り専用ツールだけを許可する。
+export function decideReplayPermission(
+	params: AcpRequestPermissionParams,
+	mcpToolNames: ReadonlySet<string> = new Set(),
+): Readonly<{
+	allowed: boolean;
+	outcome: AcpPermissionOutcome;
+}> {
+	const toolCall = params.toolCall;
+	const kind = toolCall?.kind?.toLowerCase();
+	const rawName = toolCall === undefined ? undefined : extractAcpToolName(toolCall);
+	const isPrefixedMcp = isPrefixedLunaMcpTool(rawName);
+	const isUnsafeBuiltinKind = kind !== undefined && REPLAY_DENIED_PERMISSION_KINDS.has(kind);
+	const allowed =
+		isPrefixedMcp ||
+		(!isUnsafeBuiltinKind &&
+			((kind !== undefined && REPLAY_ALLOWED_PERMISSION_KINDS.has(kind)) ||
+				isAllowedBuiltinReplayToolName(rawName) ||
+				resolveMcpToolName(rawName, mcpToolNames) !== undefined));
+	if (allowed) {
+		return { allowed: true, outcome: pickAllowPermissionOutcome(params.options) };
+	}
+	return { allowed: false, outcome: pickRejectPermissionOutcome(params.options) };
+}
+
+export function createReplayAntigravityRuntime(input: {
+	cwd: string;
+	geminiDir: string;
+	transcriptDir: string;
+	scratchRoot: string;
+	childEnvironment: Readonly<Record<string, string | undefined>>;
+	requestTimeoutMs: number;
+	logger: LoggerPort;
+	onCall: (name: string, argumentsValue: unknown) => void;
+	createClient?: (input: { cwd: string; geminiDir: string }) => AcpClientPort;
+}): AntigravityAcpRuntime {
+	return new AntigravityAcpRuntime({
+		workspaceDir: input.cwd,
+		geminiDir: input.geminiDir,
+		transcriptDir: input.transcriptDir,
+		scratchRoot: input.scratchRoot,
+		childEnvironment: input.childEnvironment,
+		retryDelaysMs: [15_000],
+		requestTimeoutMs: input.requestTimeoutMs,
+		logger: input.logger,
+		now: () => new Date(),
+		dangerouslySkipPermissions: false,
+		onPermissionRequest: (params, context) =>
+			decideReplayPermission(params, context.mcpToolNames).outcome,
+		routingInstructions: REPLAY_ANTIGRAVITY_ROUTING_INSTRUCTIONS,
+		onBuiltinToolCall: (name, args) => {
+			input.onCall(name, args);
+		},
+		createClient: input.createClient,
+		createShellTools: () => ({
+			tools: REPLAY_STUBBED_HARNESS_TOOLS.map((name) => ({
+				name,
+				description: `${name} is not executed during a replay. Calls are recorded and treated as successful.`,
+				parameters: { type: "object", additionalProperties: true },
+				execute: (argumentsValue) => {
+					input.onCall(name, argumentsValue);
+					return Promise.resolve({ text: REPLAY_STUB_RESULT, images: [], isError: false });
+				},
+			})),
+			background: NO_BACKGROUND,
+			dispose: async () => {},
+		}),
+	});
+}
+
 // 再生では外へ作用するツールを動かさず、読むだけのツールとWeb検索だけを本物にする。
 export function createReplayHarnessTools(
 	spec: AgentSessionSpec,
@@ -362,17 +475,9 @@ export function createReplayHarnessTools(
 			),
 		],
 	];
-	const stubbed: readonly HarnessToolName[] = [
-		"exec_command",
-		"write_stdin",
-		"stop_background",
-		"edit",
-		"write",
-		"image_gen",
-	];
 	const tools = [
 		...live.map(([name, tool]) => recordCalls(name, tool, onCall)),
-		...stubbed.map((name) =>
+		...REPLAY_STUBBED_HARNESS_TOOLS.map((name) =>
 			toPiAgentTool({
 				name,
 				description: `${name} is not executed during a replay. Calls are recorded and treated as successful.`,
@@ -389,6 +494,46 @@ export function createReplayHarnessTools(
 		background: NO_BACKGROUND,
 		dispose: async () => {},
 	};
+}
+
+function isAllowedBuiltinReplayToolName(rawName: string | undefined): boolean {
+	if (rawName === undefined) return false;
+	return REPLAY_ALLOWED_BUILTIN_TOOL_NAMES.has(rawName.toLowerCase());
+}
+
+function isPrefixedLunaMcpTool(rawName: string | undefined): boolean {
+	if (rawName === undefined) return false;
+	const lower = rawName.toLowerCase();
+	return (
+		lower.startsWith(`mcp_${LUNA_MCP_SERVER_NAME}_`) ||
+		lower.startsWith(`${LUNA_MCP_SERVER_NAME}__`) ||
+		lower.startsWith(`${LUNA_MCP_SERVER_NAME}:`) ||
+		lower.startsWith(`${LUNA_MCP_SERVER_NAME}/`)
+	);
+}
+
+function pickAllowPermissionOutcome(
+	options: readonly AcpPermissionOption[] | undefined,
+): AcpPermissionOutcome {
+	const preferred =
+		options?.find((option) => option.kind === "allow_once") ??
+		options?.find((option) => option.kind?.startsWith("allow") ?? false) ??
+		options?.find((option) => option.optionId.toLowerCase().includes("allow")) ??
+		options?.[0];
+	return { outcome: "selected", optionId: preferred?.optionId ?? "allow" };
+}
+
+function pickRejectPermissionOutcome(
+	options: readonly AcpPermissionOption[] | undefined,
+): AcpPermissionOutcome {
+	const preferred =
+		options?.find((option) => option.kind === "reject_once") ??
+		options?.find((option) => option.kind?.startsWith("reject") ?? false) ??
+		options?.find((option) => option.optionId.toLowerCase().includes("reject"));
+	if (preferred !== undefined) {
+		return { outcome: "selected", optionId: preferred.optionId };
+	}
+	return { outcome: "cancelled" };
 }
 
 const NO_BACKGROUND: HarnessBackground = { count: () => 0, stopAll: async () => {} };
@@ -429,7 +574,7 @@ function createViewImageTool(read: AnyPiAgentTool): AnyPiAgentTool {
 }
 
 // 割り込み判定の鍵は課金を伴うため、エージェントのシェルからは使わせない。
-function withoutSecrets(
+export function withoutSecrets(
 	environment: NodeJS.ProcessEnv,
 ): Readonly<Record<string, string | undefined>> {
 	const {
