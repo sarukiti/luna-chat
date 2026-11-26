@@ -5,9 +5,12 @@ import { join, resolve } from "node:path";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { z } from "zod";
 
+import type { AcpClientPort } from "../modules/agent/adapters/outbound/antigravity/acp-client";
+import { ANTIGRAVITY_PROVIDER_ID } from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
 import type { ChatGptBackend } from "../modules/agent/adapters/outbound/pi/chatgpt-backend";
 import { PiAgentRuntime } from "../modules/agent/adapters/outbound/pi/pi-agent-runtime";
 import type {
+	AgentRuntimePort,
 	AgentSession,
 	HarnessToolName,
 	ModelSelection,
@@ -26,9 +29,12 @@ import { resolveLunaHome } from "../modules/workspace/adapters/initialize-worksp
 import { readWorkspaceSkillsPrompt } from "../modules/workspace/adapters/workspace-skills";
 import { readWorkspaceBaseInstructions } from "../modules/workspace/application/workspace-instructions";
 import {
+	antigravityDir,
 	createAgentModels,
 	createChatGptBackend,
+	createReplayAntigravityRuntime,
 	createReplayHarnessTools,
+	withoutSecrets,
 	workerCatalogOf,
 } from "./agent-runtime";
 import { buildSystemPrompt } from "./session-factory";
@@ -39,6 +45,7 @@ const MAX_CALLS_PER_SCENE = 12;
 const REPLAY_HARNESS_TOOLS: readonly HarnessToolName[] = [
 	"exec_command",
 	"write_stdin",
+	"stop_background",
 	"read",
 	"edit",
 	"write",
@@ -79,6 +86,11 @@ export async function runReplay(input: {
 	transcriptDir: string;
 	variants: readonly ReplayVariant[];
 	workers: WorkerCatalog;
+	antigravity?: Readonly<{
+		geminiDir: string;
+		childEnvironment: Readonly<Record<string, string | undefined>>;
+		createClient?: (input: { cwd: string; geminiDir: string }) => AcpClientPort;
+	}>;
 	onResult?: (result: ReplayResult) => void;
 }): Promise<ReplayResult[]> {
 	let calls: ReplayCall[] = [];
@@ -87,52 +99,78 @@ export async function runReplay(input: {
 		calls.push({ tool, arguments: argumentsValue });
 		if (calls.length >= MAX_CALLS_PER_SCENE) void session?.abort();
 	};
-	const runtime = new PiAgentRuntime({
-		models: input.models,
-		transcriptDir: input.transcriptDir,
-		scratchRoot: input.scratchRoot,
-		retryDelaysMs: [15_000],
-		requestTimeoutMs: input.requestTimeoutMs,
-		compaction: { model: input.model, reserveTokens: 16_384, keepRecentTokens: 20_000 },
-		createHarnessTools: (spec, context) =>
-			createReplayHarnessTools(spec, context, input.backend, record),
-		hasCredentials: () => true,
-		logger: silentLogger,
-		now: () => new Date(),
-	});
+	let runtime: AgentRuntimePort;
+	let closeRuntime: (() => Promise<void>) | undefined;
+	if (input.model.provider === ANTIGRAVITY_PROVIDER_ID) {
+		if (input.antigravity === undefined) {
+			throw new Error("Antigravity replay requires antigravity runtime options");
+		}
+		const agyRuntime = createReplayAntigravityRuntime({
+			cwd: input.cwd,
+			geminiDir: input.antigravity.geminiDir,
+			transcriptDir: input.transcriptDir,
+			scratchRoot: input.scratchRoot,
+			childEnvironment: input.antigravity.childEnvironment,
+			requestTimeoutMs: input.requestTimeoutMs,
+			logger: silentLogger,
+			onCall: record,
+			createClient: input.antigravity.createClient,
+		});
+		await agyRuntime.start();
+		runtime = agyRuntime;
+		closeRuntime = async () => await agyRuntime.close();
+	} else {
+		runtime = new PiAgentRuntime({
+			models: input.models,
+			transcriptDir: input.transcriptDir,
+			scratchRoot: input.scratchRoot,
+			retryDelaysMs: [15_000],
+			requestTimeoutMs: input.requestTimeoutMs,
+			compaction: { model: input.model, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+			createHarnessTools: (spec, context) =>
+				createReplayHarnessTools(spec, context, input.backend, record),
+			hasCredentials: () => true,
+			logger: silentLogger,
+			now: () => new Date(),
+		});
+	}
 	const toolSet = createRecordingToolSet(record, input.workers);
 
 	const results: ReplayResult[] = [];
-	for (const scene of input.scenes) {
-		for (const variant of input.variants) {
-			calls = [];
-			// 表は開いたセッション1つにしかつなげないため、場面ごとに作り直す。
-			const activities = createActivityTable();
-			const tools = toolSet.bind({ ownerId: "replay", origin: REPLAY_ORIGIN, activities });
-			session = runtime.open({
-				kind: "conversation",
-				label: `replay:${scene.id}:${variant.name}`,
-				cwd: input.cwd,
-				systemPrompt: variant.systemPrompt,
-				model: input.model,
-				tools,
-				harnessTools: REPLAY_HARNESS_TOOLS,
-				fastMode: () => false,
-				activities,
-			});
-			let status: string;
-			try {
-				const run = await session.run(scene.inputs);
-				status = run.status === "failed" ? `failed: ${run.reason}: ${run.message}` : run.status;
-			} finally {
-				await session.close();
+	try {
+		for (const scene of input.scenes) {
+			for (const variant of input.variants) {
+				calls = [];
+				// 表は開いたセッション1つにしかつなげないため、場面ごとに作り直す。
+				const activities = createActivityTable();
+				const tools = toolSet.bind({ ownerId: "replay", origin: REPLAY_ORIGIN, activities });
+				session = runtime.open({
+					kind: "conversation",
+					label: `replay:${scene.id}:${variant.name}`,
+					cwd: input.cwd,
+					systemPrompt: variant.systemPrompt,
+					model: input.model,
+					tools,
+					harnessTools: REPLAY_HARNESS_TOOLS,
+					fastMode: () => false,
+					activities,
+				});
+				let status: string;
+				try {
+					const run = await session.run(scene.inputs);
+					status = run.status === "failed" ? `failed: ${run.reason}: ${run.message}` : run.status;
+				} finally {
+					await session.close();
+				}
+				const result = { scene: scene.id, variant: variant.name, status, calls };
+				results.push(result);
+				input.onResult?.(result);
 			}
-			const result = { scene: scene.id, variant: variant.name, status, calls };
-			results.push(result);
-			input.onResult?.(result);
 		}
+		return results;
+	} finally {
+		await closeRuntime?.();
 	}
-	return results;
 }
 
 // どの指示で出た結果かを伏せて採点できるよう、場面ごとに候補の並びを入れ替えて A, B… と名付ける。
@@ -226,6 +264,10 @@ export async function runReplayCommand(
 			transcriptDir: join(workDir, "sessions"),
 			variants,
 			workers: workerCatalogOf(config.models.worker),
+			antigravity: {
+				geminiDir: antigravityDir(lunaHomeDir),
+				childEnvironment: withoutSecrets(process.env),
+			},
 			onResult: (result) => {
 				process.stdout.write(
 					`${result.scene} ${result.variant} ${result.status} calls=${String(result.calls.length)}\n`,
