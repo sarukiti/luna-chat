@@ -16,8 +16,8 @@ Lunaは、単一のNode.jsプロセス内でDiscordとHTTPの会話、自律タ�
 Discord Gateway ─► discord ─► conversation ──────────┐
 ローカルHTTP ────► http ─────► conversation ──────────┤
                            └──► event executor ───────┼─► AgentRuntimePort ─► pi Agent ─► ChatGPT（openai-codex）／Claude Code CLI（claude-code）
-automation sources ──────────► event executor ────────┤        │ セッションごとのツール
-Home Assistant ──► home-assistant ─► conversation ──────┤        │
+automation sources ──────────► event executor ────────┤        │                └─► Antigravity ACP（agy acp）─► ローカル HTTP MCP
+Home Assistant ──► home-assistant ─► conversation ──────┤        │ セッションごとのツール
 Discord VC ──► voice ─► conversation ───────────────────┤        │
 task service（作業エージェント）──────────────────────┘         ▼
       ▲  task_create / task_message / task_cancel          tool（Discord・タスク・HTTP応答・待機）
@@ -28,10 +28,10 @@ task service（作業エージェント）────────────�
 minecraft のツール（minecraft の作業エージェントのみ）─► minecraft ─► Mineflayer（worker thread）─► Minecraftサーバー
                                                               └─► 決定モデル（pi-ai の classify）
 
-外部リソース: LUNA_HOME / マウントされたファイルシステム / stdout / ChatGPTのバックエンド / Claude Code CLI（子プロセス）とAnthropic API / Home Assistant（REST・WebSocket）/ TTSエンジン / Minecraftサーバー
+外部リソース: LUNA_HOME / マウントされたファイルシステム / stdout / ChatGPTのバックエンド / Claude Code CLI（子プロセス）とAnthropic API / Antigravity CLI（`agy acp` 子プロセス） / Home Assistant（REST・WebSocket）/ TTSエンジン / Minecraftサーバー
 ```
 
-- エージェントループとツールの実行は常にLunaのプロセス内で行う。`claude-code` だけは、モデルとの通信を Claude Code CLI の子プロセスに任せる（[agent.md](./agent.md)）。
+- `openai-codex` と `claude-code` ではエージェントループとツールの実行を Luna のプロセス内で行う（`claude-code` はモデルとの通信だけを Claude Code CLI の子プロセスに任せる）。`antigravity` ではエージェントループと組み込みツール（ファイル・画像閲覧・Web検索・画像生成）を `agy acp` に任せ、Luna 固有のツールとバックグラウンド対応シェルツールをローカル HTTP MCP サーバー経由で Luna のプロセス内で実行する（[agent.md](./agent.md)）。
 - ダッシュボードは、HTTP APIとは別のHonoサーバーとして別ポートで待ち受ける。
 
 ## ソースコード構成
@@ -70,7 +70,7 @@ src/
 | ---------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `discord`        | メッセージ正規化、スコープ判定、Discordツール、タイピング管理                                | イベント変換、ツールプロバイダ、Discord API呼び出し、Gateway購読                                               | discord.js Gateway/REST                                                                        |
 | `conversation`   | セッション状態、入力キュー、アイドル監視、記憶保存、モデル設定                               | `accept`、`acceptFollowUp`、`remember`、`configure`、`endSession`、`typing`、`stopIntake`、`drain`             | Discordコントローラー、履歴取得                                                                |
-| `agent`          | エージェントのセッション、再試行、圧縮、記録、汎用ツール、認証と使用枠                       | `open`（セッションの `run`・`steer`・`abort`・`setModel`・`close`）、`listModels`、`status`、`ModelStreamPort` | pi-agent-core、pi-ai、pi-coding-agent、ファイル                                                |
+| `agent`          | エージェントのセッション、再試行、圧縮、記録、汎用ツール、認証と使用枠                       | `open`（セッションの `run`・`steer`・`abort`・`setModel`・`close`）、`listModels`、`status`、`ModelStreamPort` | pi-agent-core、pi-ai、pi-coding-agent、agy acp、ローカル HTTP MCP、ファイル                    |
 | `event`          | 共通イベント（`LunaEvent`）と入力メッセージへの変換、ワンショット実行                        | `execute`                                                                                                      | なし（EventExecutorがセッションを開いて実行する）                                              |
 | `http`           | HTTPイベントの検証、受付、完了待ち応答                                                       | `submit`、`stopIntake`、`drain`                                                                                | Hono、`http_respond` ツール                                                                    |
 | `tool`           | ツールの定義、実行元（`ToolOrigin`）、ツール集合、待機                                       | `defineTool`、`createToolSet`（`bind`・`release`）、`OpenAgentSession`                                         | 待機ツール                                                                                     |
