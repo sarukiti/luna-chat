@@ -124,6 +124,6 @@ CompositeAgentRuntime
 
 ### 再生
 
-- `luna-chat replay` は、常駐プロセスとは別のプロセスで `PiAgentRuntime` を作り、場面ごと・指示の組ごとにセッションを開いて閉じる。会話の開発者指示は常駐側と同じものを使う。
-- Lunaのツールは本物の定義を、ポートだけ記録用の偽物に差し替えて組み立てる。
+- `luna-chat replay` は、常駐プロセスとは別のプロセスで、`[models.conversation]` の提供元に応じたランタイム（`antigravity` なら `AntigravityAcpRuntime`、それ以外は `PiAgentRuntime`）を作り、場面ごと・指示の組ごとにセッションを開いて閉じる。会話の開発者指示は常駐側と同じものを使う。
+- Lunaのツールは本物の定義を、ポートだけ記録用の偽物に差し替えて組み立てる。`antigravity` では、`exec_command`・`write_stdin`・`stop_background`・`edit`・`write`・`image_gen` も記録用の MCP スタブとして渡し、`agy acp` を `--dangerously-skip-permissions` なしで起動して `session/request_permission` で読み取り系と MCP 以外の組み込みツール（ファイル書き込み・コマンド実行等）を拒否する。
 - 記録は一時ディレクトリへ書き、終了時に消す。本物の会話記録に混ぜると、エージェントが次に記録を見直す時に再生を本物の会話と取り違えるため。
