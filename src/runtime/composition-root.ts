@@ -5,12 +5,19 @@ import type { Models } from "@earendil-works/pi-ai";
 import type { Client } from "discord.js";
 
 import { ANTIGRAVITY_PROVIDER_ID } from "../modules/agent/adapters/outbound/antigravity/acp-protocol";
-import { CompositeAgentRuntime } from "../modules/agent/adapters/outbound/antigravity/composite-agent-runtime";
+import {
+	CompositeAgentRuntime,
+	mergeUsageSnapshots,
+} from "../modules/agent/adapters/outbound/antigravity/composite-agent-runtime";
+import { fetchAntigravityUsage } from "../modules/agent/adapters/outbound/antigravity/usage";
 import { OPENAI_CODEX_PROVIDER_ID } from "../modules/agent/adapters/outbound/pi/chatgpt-backend";
 import { PiModelStreams } from "../modules/agent/adapters/outbound/pi/pi-model-stream";
 import { fetchUsage } from "../modules/agent/adapters/outbound/pi/usage";
 import { UsagePoller } from "../modules/agent/adapters/outbound/pi/usage-poller";
-import type { ModelSelection } from "../modules/agent/ports/outbound/agent-session-port";
+import type {
+	ModelSelection,
+	UsageSnapshot,
+} from "../modules/agent/ports/outbound/agent-session-port";
 import { ChildProcessCheckRunner } from "../modules/automation/adapters/child-process-check-runner";
 import { ChokidarScheduleWatcher } from "../modules/automation/adapters/chokidar-schedule-watcher";
 import { CronScheduleTimer } from "../modules/automation/adapters/cron-schedule-timer";
@@ -148,6 +155,7 @@ import type {
 } from "../modules/workspace/domain/workspace-config";
 import {
 	activeModelSelectionsOf,
+	antigravityDir,
 	createAntigravityAcpRuntime,
 	createChatGptBackend,
 	createAgentModels,
@@ -155,6 +163,7 @@ import {
 	createPiAgentRuntime,
 	usesProvider,
 	validateModelSelections,
+	withoutSecrets,
 	workerCatalogOf,
 } from "./agent-runtime";
 import { readRuntimeEnvironment } from "./runtime-environment";
@@ -341,6 +350,7 @@ export async function startLunaApplication(
 		throw new Error("models.voice: antigravity provider is not supported for voice front model");
 	}
 	const usesAntigravity = usesProvider(configuredSelections, ANTIGRAVITY_PROVIDER_ID);
+	const usesAntigravityUsage = usesProvider(activeSelections, ANTIGRAVITY_PROVIDER_ID);
 	const usesOpenAiCodex = usesProvider(activeSelections, OPENAI_CODEX_PROVIDER_ID);
 	const antigravityAgent = usesAntigravity
 		? createAntigravityAcpRuntime({
@@ -352,17 +362,76 @@ export async function startLunaApplication(
 				skillUsage,
 			})
 		: undefined;
+	const preferAntigravityUsage =
+		antigravityAgent !== undefined &&
+		(!usesOpenAiCodex || workspace.config.models.conversation.provider === ANTIGRAVITY_PROVIDER_ID);
 	const agent = new CompositeAgentRuntime({
 		pi: piAgent,
 		antigravity: antigravityAgent,
 		preferAntigravityAuth: !usesOpenAiCodex && antigravityAgent !== undefined,
+		preferAntigravityUsage,
 	});
+	const fetchAntigravity = (signal: AbortSignal): Promise<UsageSnapshot> =>
+		fetchAntigravityUsage(
+			{
+				cwd: workspace.workspaceDir,
+				geminiDir: antigravityDir(workspace.lunaHomeDir),
+				env: withoutSecrets(process.env),
+			},
+			signal,
+		);
 	const usage = new UsagePoller({
-		fetch: async (signal) => await fetchUsage(backend, signal),
+		fetch: async (signal) => {
+			if (usesOpenAiCodex && usesAntigravityUsage && antigravityAgent !== undefined) {
+				const [piResult, agyResult] = await Promise.allSettled([
+					fetchUsage(backend, signal),
+					fetchAntigravity(signal),
+				]);
+				const piSnapshot = piResult.status === "fulfilled" ? piResult.value : null;
+				const agySnapshot = agyResult.status === "fulfilled" ? agyResult.value : null;
+				if (piSnapshot != null) piAgent.setUsage(piSnapshot);
+				if (agySnapshot != null) antigravityAgent.setUsage(agySnapshot);
+				if (piResult.status === "rejected" && agyResult.status === "rejected") {
+					throw preferAntigravityUsage ? agyResult.reason : piResult.reason;
+				}
+				if (piResult.status === "rejected" && !signal.aborted) {
+					logger.warn("agent.usage_fetch_failed", {
+						error: piResult.reason,
+						provider: OPENAI_CODEX_PROVIDER_ID,
+					});
+				}
+				if (agyResult.status === "rejected" && !signal.aborted) {
+					logger.warn("agent.usage_fetch_failed", {
+						error: agyResult.reason,
+						provider: ANTIGRAVITY_PROVIDER_ID,
+					});
+				}
+				const merged = preferAntigravityUsage
+					? mergeUsageSnapshots(agySnapshot, piSnapshot)
+					: mergeUsageSnapshots(piSnapshot, agySnapshot);
+				if (merged == null) {
+					throw new Error("No usage snapshot returned");
+				}
+				return merged;
+			}
+			if (usesAntigravityUsage && antigravityAgent !== undefined) {
+				return await fetchAntigravity(signal);
+			}
+			return await fetchUsage(backend, signal);
+		},
 		filePath: resolve(workspace.lunaHomeDir, "state", "usage.json"),
 		intervalMs: USAGE_POLL_INTERVAL_MS,
 		logger,
-		onUsage: (snapshot) => piAgent.setUsage(snapshot),
+		onUsage: (snapshot) => {
+			if (usesOpenAiCodex && usesAntigravityUsage && antigravityAgent !== undefined) {
+				return;
+			}
+			if (usesAntigravityUsage && antigravityAgent !== undefined) {
+				antigravityAgent.setUsage(snapshot);
+				return;
+			}
+			piAgent.setUsage(snapshot);
+		},
 	});
 	const withHomeAssistant = (
 		instructions: readonly string[],
@@ -449,7 +518,7 @@ export async function startLunaApplication(
 		options.startupSignal?.throwIfAborted();
 		await antigravityAgent?.start(options.startupSignal);
 		validateModelSelections(agent, configuredSelections);
-		if (usesOpenAiCodex) {
+		if (usesOpenAiCodex || (usesAntigravityUsage && antigravityAgent !== undefined)) {
 			usage.start();
 		}
 		await client.login(environment.discordBotToken);

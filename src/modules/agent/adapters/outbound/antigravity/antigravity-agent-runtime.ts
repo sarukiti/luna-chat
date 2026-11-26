@@ -13,6 +13,7 @@ import type {
 	AgentTool,
 	HarnessToolName,
 	ModelSelection,
+	UsageSnapshot,
 } from "../../../ports/outbound/agent-session-port";
 import type { HarnessBackground, HarnessBackgroundListener } from "../pi/pi-agent-session";
 import { pruneTranscripts, TranscriptWriter, transcriptFilePath } from "../pi/pi-transcript";
@@ -77,6 +78,7 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 	#lastFailure: { at: string; message: string } | null = null;
 	#models: readonly AgentModel[] = [];
 	#started = false;
+	#usage: UsageSnapshot | null = null;
 
 	constructor(options: AntigravityAcpRuntimeOptions) {
 		this.#options = options;
@@ -229,10 +231,14 @@ export class AntigravityAcpRuntime implements AgentRuntimePort {
 	status(): AgentRuntimeStatus {
 		return {
 			auth: !this.#started ? "missing" : this.#authFailed ? "auth_required" : "ready",
-			usage: null,
+			usage: this.#usage,
 			lastFailure: this.#lastFailure,
 			sessions: [...this.#sessions.values()].map((session) => session.status()),
 		};
+	}
+
+	setUsage(usage: UsageSnapshot): void {
+		this.#usage = usage;
 	}
 
 	pruneTranscripts(now: Date, retentionMs: number): Promise<number> {

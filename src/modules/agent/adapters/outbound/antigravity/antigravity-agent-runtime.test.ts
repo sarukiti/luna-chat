@@ -15,6 +15,7 @@ import type {
 	AgentSessionSpec,
 	AgentTool,
 	ModelSelection,
+	UsageSnapshot,
 } from "../../../ports/outbound/agent-session-port";
 import { SessionBusyError, SessionClosedError } from "../pi/pi-agent-session";
 import type { HarnessBackgroundListener } from "../pi/pi-agent-session";
@@ -686,12 +687,37 @@ describe("AntigravityAcpRuntime と AntigravityAgentSession", () => {
 		await session.stopActivities();
 		expect(session.hasActivity()).toBe(false);
 	});
+
+	it("setUsage で使用枠を status() に反映する", async () => {
+		const { runtime } = await setup();
+		expect(runtime.status().usage).toBeNull();
+
+		const snapshot: UsageSnapshot = {
+			fetchedAt: "2026-11-26T08:00:00.000Z",
+			planType: "antigravity",
+			limits: [
+				{
+					limitId: "antigravity:gemini",
+					primary: { usedPercent: 3, windowMinutes: 300, resetsAt: "2026-11-26T12:27:37.000Z" },
+					secondary: {
+						usedPercent: 1,
+						windowMinutes: 10_080,
+						resetsAt: "2026-12-03T07:27:37.000Z",
+					},
+				},
+			],
+		};
+		runtime.setUsage(snapshot);
+
+		expect(runtime.status().usage).toEqual(snapshot);
+	});
 });
 
 describe("CompositeAgentRuntime", () => {
 	function stubRuntime(
 		models: readonly AgentModel[],
 		auth: "ready" | "auth_required" | "missing",
+		usage: UsageSnapshot | null = null,
 	): AgentRuntimePort & { opened: ModelSelection[] } {
 		const opened: ModelSelection[] = [];
 		return {
@@ -721,7 +747,7 @@ describe("CompositeAgentRuntime", () => {
 				return session;
 			},
 			listModels: () => models,
-			status: () => ({ auth, usage: null, lastFailure: null, sessions: [] }),
+			status: () => ({ auth, usage, lastFailure: null, sessions: [] }),
 		};
 	}
 
@@ -770,5 +796,61 @@ describe("CompositeAgentRuntime", () => {
 			"antigravity/gemini-4-neon",
 		]);
 		expect(composite.status().auth).toBe("ready");
+	});
+
+	it("pi と antigravity の使用枠を優先順に応じて統合する", () => {
+		const piUsage: UsageSnapshot = {
+			fetchedAt: "2026-11-26T08:00:00.000Z",
+			planType: "pro",
+			limits: [
+				{
+					limitId: "codex",
+					primary: { usedPercent: 10, windowMinutes: 300, resetsAt: "2026-11-26T12:00:00.000Z" },
+					secondary: null,
+				},
+			],
+		};
+		const agyUsage: UsageSnapshot = {
+			fetchedAt: "2026-11-26T08:01:00.000Z",
+			planType: "antigravity",
+			limits: [
+				{
+					limitId: "antigravity:gemini",
+					primary: { usedPercent: 5, windowMinutes: 300, resetsAt: "2026-11-26T12:30:00.000Z" },
+					secondary: null,
+				},
+			],
+		};
+
+		const preferAgy = new CompositeAgentRuntime({
+			pi: stubRuntime([], "ready", piUsage),
+			antigravity: stubRuntime([], "ready", agyUsage),
+			preferAntigravityAuth: false,
+			preferAntigravityUsage: true,
+		});
+		expect(preferAgy.status().usage).toEqual({
+			fetchedAt: "2026-11-26T08:01:00.000Z",
+			planType: "antigravity",
+			limits: [...agyUsage.limits, ...piUsage.limits],
+		});
+
+		const preferPi = new CompositeAgentRuntime({
+			pi: stubRuntime([], "ready", piUsage),
+			antigravity: stubRuntime([], "ready", agyUsage),
+			preferAntigravityAuth: false,
+			preferAntigravityUsage: false,
+		});
+		expect(preferPi.status().usage).toEqual({
+			fetchedAt: "2026-11-26T08:01:00.000Z",
+			planType: "pro",
+			limits: [...piUsage.limits, ...agyUsage.limits],
+		});
+
+		const agyOnly = new CompositeAgentRuntime({
+			pi: stubRuntime([], "missing", null),
+			antigravity: stubRuntime([], "ready", agyUsage),
+			preferAntigravityAuth: true,
+		});
+		expect(agyOnly.status().usage).toEqual(agyUsage);
 	});
 });
